@@ -199,8 +199,17 @@ func qualityMeetsEncryptedFloor(sig QualityStreamSignals) bool {
 	return int64(sig.EncryptedBytes) >= floor
 }
 
-func qualityHasDumpBill(sig QualityStreamSignals) bool {
-	return sig.ReasoningTokens >= defaultBurstMinReasoning || qualityMeetsEncryptedFloor(sig)
+func qualityHasValidThinking(sig QualityStreamSignals) bool {
+	if sig.HasReasoningDelta {
+		return true
+	}
+	if !sig.HasThinking {
+		return false
+	}
+	if sig.EncryptedBytes > 0 {
+		return qualityMeetsEncryptedFloor(sig)
+	}
+	return true
 }
 
 func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
@@ -216,43 +225,22 @@ func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
 	if sig.HoldExpired && shortVisible && heavyReasoning {
 		return true
 	}
-	if qualityFastFlush(sig, defaultBurstFlushMS) && qualityHasDumpBill(sig) {
-		return true
-	}
 	return false
 }
 
-// qualityIsFakeEncryptedDump is the 18190 / 18183 dump: ciphertext or a
-// large reasoning bill, then the visible answer arrives in <2s. Visible
-// token count is not a gate — vis<8 chat dumps were leaking on minOutput.
+// qualityIsFakeEncryptedDump catches streams that bill heavy reasoning tokens
+// without valid thinking (either usage-only reasoning with no ciphertext/deltas
+// or undersized ciphertext below the token-relative floor), including vis<minOutput
+// chat dumps.
 func qualityIsFakeEncryptedDump(sig QualityStreamSignals, minOutput int64) bool {
 	_ = minOutput
-	if sig.HasReasoningDelta {
+	if qualityHasValidThinking(sig) {
 		return false
 	}
-	if !qualityFastFlush(sig, defaultFakeEncFlushMS) {
+	if sig.ReasoningTokens < defaultBurstMinReasoning {
 		return false
 	}
-	return qualityHasDumpBill(sig)
-}
-
-// qualityIsFastReasoningRatioDump catches plaintext thinking that is still a
-// 1ms dump: billed reasoning is ≥80% of output and the visible flush is <2s.
-func qualityIsFastReasoningRatioDump(sig QualityStreamSignals) bool {
-	if !sig.HasReasoningDelta {
-		return false
-	}
-	if !qualityFastFlush(sig, defaultFakeEncFlushMS) {
-		return false
-	}
-	output := sig.OutputTokens
-	if output <= 0 {
-		output = sig.VisibleTokens + sig.ReasoningTokens
-	}
-	if output <= 0 || sig.ReasoningTokens <= 0 {
-		return false
-	}
-	return sig.ReasoningTokens*5 >= output*4
+	return sig.Terminal || qualityFastFlush(sig, defaultFakeEncFlushMS)
 }
 
 // qualityIsCipherDrool is the 128k TUI status-loop: ciphertext met the
@@ -279,25 +267,28 @@ func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
 }
 
 // ClassifyQualityHold decides whether a held stream may be forwarded.
-// Dump detectors run first so plaintext thinking cannot veto a 1ms
-// reasoning-ratio dump, and vis<minOutput cannot skip fake-enc/burst.
-// Remaining plaintext deltas still deliver. Cipher-only HasThinking waits
-// until visible text has streamed for 2s or the stream ends.
+// Streamed plaintext reasoning deltas deliver immediately. Cipher-only
+// thinking that meets the configured floor waits until visible text has
+// streamed for 2s or the stream reaches a terminal event (so usage can verify
+// the token-relative ciphertext floor and rule out 0-reasoning cipher drool).
 func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdict {
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
-	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) {
+	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) {
 		return QualityWithhold
 	}
-	if sig.HasThinking {
+	if qualityHasValidThinking(sig) {
 		if sig.HasReasoningDelta {
 			return QualityDeliver
 		}
 		// Cipher-only: do not release when encrypted_content first meets
-		// the floor. Fake dumps send the blob, then the whole answer in
-		// <2s; releasing early lets that dump bypass fake-enc. Wait until
-		// visible text has streamed for 2s, or the stream ends.
+		// the base floor before usage arrives. Wait until visible text has
+		// streamed for 2s, or the stream ends and terminal usage confirms
+		// the token-relative floor.
+		if !sig.FirstVisible && !sig.Terminal {
+			return QualityWait
+		}
 		if sig.Terminal {
 			return QualityDeliver
 		}
