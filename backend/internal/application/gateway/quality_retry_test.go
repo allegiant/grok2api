@@ -178,6 +178,16 @@ func TestClassifyQualityHoldBurst(t *testing.T) {
 			sig:  QualityStreamSignals{VisibleTokens: 1, OutputTokens: 2313, ReasoningTokens: 2312, FirstVisible: true, VisibleFlushMS: 1, Terminal: true, UsageReported: true},
 			want: QualityWithhold,
 		},
+		{
+			name: "cipher stub 0 reasoning tool call 57 output tokens withholds",
+			sig:  QualityStreamSignals{HasThinking: true, ReasoningStarted: true, VisibleTokens: 0, OutputTokens: 57, ReasoningTokens: 0, EncryptedBytes: 800, EncryptedFloor: 256, Terminal: true, UsageReported: true},
+			want: QualityWithhold,
+		},
+		{
+			name: "no-think CJK low rune count 57 output tokens 0 reasoning withholds",
+			sig:  QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 5, OutputTokens: 57, ReasoningTokens: 0, FirstVisible: true, VisibleFlushMS: 2, Terminal: true, UsageReported: true},
+			want: QualityWithhold,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -795,6 +805,20 @@ func TestObserveQualityChunkEmptyReasoningStubIsNotThinking(t *testing.T) {
 	}
 	if ClassifyQualityHold(respSig, 32) != QualityWithhold {
 		t.Fatalf("empty reasoning item + 0 tokens must withhold, got %s (%#v)", ClassifyQualityHold(respSig, 32), respSig)
+	}
+
+	cipher := strings.Repeat("A", defaultMinEncryptedBytes*2)
+	zeroReasoningCipher := qualityScanState{protocol: qualityProtocolResponses}
+	ObserveQualityChunk(&zeroReasoningCipher, []byte(sse(
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"`+cipher+`"}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call"}}`,
+		`data: {"type":"response.function_call_arguments.delta","delta":"{\"command\":\"ls -la\"}"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","usage":{"output_tokens":57,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+	)))
+	zeroSig := zeroReasoningCipher.signals()
+	if ClassifyQualityHold(zeroSig, 8) != QualityWithhold {
+		t.Fatalf("0-reasoning cipher stub with 57 output tokens must withhold, got %s (%#v)", ClassifyQualityHold(zeroSig, 8), zeroSig)
 	}
 }
 

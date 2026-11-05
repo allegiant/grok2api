@@ -206,6 +206,9 @@ func qualityHasValidThinking(sig QualityStreamSignals) bool {
 	if !sig.HasThinking {
 		return false
 	}
+	if (sig.Terminal || sig.UsageReported) && sig.ReasoningTokens <= 0 {
+		return false
+	}
 	if sig.EncryptedBytes > 0 {
 		return qualityMeetsEncryptedFloor(sig)
 	}
@@ -260,7 +263,7 @@ func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
 	if visible >= defaultCipherDroolVisible {
 		return true
 	}
-	if sig.Terminal && visible >= minOutput {
+	if sig.Terminal && max(visible, sig.OutputTokens) >= minOutput {
 		return true
 	}
 	return false
@@ -304,6 +307,8 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	output := sig.VisibleTokens
 	if output <= 0 {
 		output = sig.OutputTokens
+	} else if sig.UsageReported {
+		output = max(output, sig.OutputTokens-max(sig.ReasoningTokens, 0))
 	}
 	enough := output >= minOutput
 	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
