@@ -200,6 +200,9 @@ func qualityMeetsEncryptedFloor(sig QualityStreamSignals) bool {
 }
 
 func qualityHasValidThinking(sig QualityStreamSignals) bool {
+	if sig.UsageReported && sig.ReasoningTokens <= 0 {
+		return false
+	}
 	if sig.HasReasoningDelta {
 		return true
 	}
@@ -253,7 +256,7 @@ func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
-	if sig.HasReasoningDelta || sig.ReasoningTokens > 0 {
+	if (sig.HasReasoningDelta && (!sig.UsageReported || sig.ReasoningTokens > 0)) || sig.ReasoningTokens > 0 {
 		return false
 	}
 	if sig.EncryptedBytes <= 0 {
@@ -263,7 +266,7 @@ func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
 	if visible >= defaultCipherDroolVisible {
 		return true
 	}
-	if sig.Terminal && max(visible, sig.OutputTokens) >= minOutput {
+	if sig.Terminal && max(visible, sig.OutputTokens) >= min(minOutput, defaultQualityMinOutput) {
 		return true
 	}
 	return false
@@ -310,7 +313,11 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	} else if sig.UsageReported {
 		output = max(output, sig.OutputTokens-max(sig.ReasoningTokens, 0))
 	}
-	enough := output >= minOutput
+	effectiveMinOutput := minOutput
+	if sig.Terminal && (sig.ReasoningStarted || sig.EncryptedBytes > 0 || sig.UsageReported) && sig.ReasoningTokens <= 0 {
+		effectiveMinOutput = min(minOutput, defaultQualityMinOutput)
+	}
+	enough := output >= effectiveMinOutput
 	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
 		return QualityWait
 	}
@@ -471,16 +478,53 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 // rejected. Both may be held, audited, and penalized, but neither is replayed
 // on another account.
 func canReplayQualityHoldAcrossAccounts(input Input, ownership *inferencedomain.ResponseOwnership) bool {
-	return ownership == nil && !qualityRequestHasReplayUnsafeHostedTools(input.Body)
+	if ownership != nil {
+		return false
+	}
+	if qualityInputAllowsHostedSearchReplay(input) {
+		return !qualityRequestHasReplayUnsafeHostedToolsWithPolicy(input.Body, true)
+	}
+	return !qualityRequestHasReplayUnsafeHostedTools(input.Body)
+}
+
+func qualityInputAllowsHostedSearchReplay(input Input) bool {
+	if input.AllowClientToolCacheRoute || strings.TrimSpace(input.PromptCacheSeed) != "" {
+		return true
+	}
+	for name, values := range input.Headers {
+		lowerName := strings.ToLower(strings.TrimSpace(name))
+		switch lowerName {
+		case "x-grok-conv-id", "x-grok-client-identifier", "x-grok-agent-id", "x-claude-code-session-id", "x-codex-turn-metadata", "x-codex-window-id":
+			for _, v := range values {
+				if strings.TrimSpace(v) != "" {
+					return true
+				}
+			}
+		case "user-agent":
+			for _, v := range values {
+				ua := strings.ToLower(v)
+				if strings.Contains(ua, "grok-shell") || strings.Contains(ua, "grok-pager") || strings.Contains(ua, "codex") || strings.Contains(ua, "claude") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func qualityRequestHasReplayUnsafeHostedTools(body []byte) bool {
+	return qualityRequestHasReplayUnsafeHostedToolsWithPolicy(body, false)
+}
+
+func qualityRequestHasReplayUnsafeHostedToolsWithPolicy(body []byte, allowHostedSearchAndCode bool) bool {
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil || payload == nil {
 		return false
 	}
-	if raw, exists := payload["web_search_options"]; exists && raw != nil {
-		return true
+	if !allowHostedSearchAndCode {
+		if raw, exists := payload["web_search_options"]; exists && raw != nil {
+			return true
+		}
 	}
 	if raw, exists := payload["mcp_servers"]; exists && raw != nil {
 		servers, ok := raw.([]any)
@@ -488,7 +532,7 @@ func qualityRequestHasReplayUnsafeHostedTools(body []byte) bool {
 			return true
 		}
 	}
-	if qualityToolListHasReplayUnsafeHostedTool(payload["tools"]) {
+	if qualityToolListHasReplayUnsafeHostedToolWithPolicy(payload["tools"], allowHostedSearchAndCode) {
 		return true
 	}
 	// Responses Tool Search can load declarations later in the request. Only
@@ -500,7 +544,7 @@ func qualityRequestHasReplayUnsafeHostedTools(body []byte) bool {
 		if !ok || jsonNodeString(item["type"]) != "additional_tools" {
 			continue
 		}
-		if qualityToolListHasReplayUnsafeHostedTool(item["tools"]) {
+		if qualityToolListHasReplayUnsafeHostedToolWithPolicy(item["tools"], allowHostedSearchAndCode) {
 			return true
 		}
 	}
@@ -508,6 +552,10 @@ func qualityRequestHasReplayUnsafeHostedTools(body []byte) bool {
 }
 
 func qualityToolListHasReplayUnsafeHostedTool(value any) bool {
+	return qualityToolListHasReplayUnsafeHostedToolWithPolicy(value, false)
+}
+
+func qualityToolListHasReplayUnsafeHostedToolWithPolicy(value any, allowHostedSearchAndCode bool) bool {
 	tools, ok := value.([]any)
 	if !ok {
 		return false
@@ -523,13 +571,24 @@ func qualityToolListHasReplayUnsafeHostedTool(value any) bool {
 			// These declarations only ask the model to return a call. Execution
 			// happens in the client after the held response is committed.
 			continue
+		case "web_search", "web_search_preview", "web_search_preview_2025_03_11",
+			"web_search_2025_08_26", "web_search_20250305", "x_search",
+			"file_search", "collections_search", "code_execution", "code_interpreter",
+			"view_image":
+			if allowHostedSearchAndCode {
+				continue
+			}
+			return true
 		case "shell":
+			if allowHostedSearchAndCode {
+				continue
+			}
 			environment, _ := tool["environment"].(map[string]any)
 			if jsonNodeString(environment["type"]) != "local" {
 				return true
 			}
 		case "namespace":
-			if qualityToolListHasReplayUnsafeHostedTool(tool["tools"]) {
+			if qualityToolListHasReplayUnsafeHostedToolWithPolicy(tool["tools"], allowHostedSearchAndCode) {
 				return true
 			}
 		default:
@@ -597,17 +656,23 @@ func (s *Service) applyOutputSpeedPenalty(ctx context.Context, record audit.Reco
 	if record.Operation == audit.OperationCompaction {
 		return nil
 	}
-	if !cfg.Enabled || !cfg.AutoDisable || forcedEgress || credential.Provider != accountdomain.ProviderBuild || !record.Streaming || record.FirstTokenMS == nil || record.OutputTokens < cfg.MinOutputTokens || !auditRequestSucceeded(record.StatusCode, record.ErrorCode) {
+	if !cfg.Enabled || forcedEgress || credential.Provider != accountdomain.ProviderBuild || !record.Streaming || record.FirstTokenMS == nil || record.OutputTokens < cfg.MinOutputTokens || !auditRequestSucceeded(record.StatusCode, record.ErrorCode) {
 		return nil
 	}
 	class, tps, _ := audit.ClassifyOutputSpeed(record.OutputTokens, record.ReasoningTokens, *record.FirstTokenMS, record.DurationMS, cfg.SoftTPS, cfg.HardTPS, cfg.MinGenerationMS, cfg.FailClosed)
 	if class == "" {
 		return nil
 	}
-	if err := s.selector.disableAccount(ctx, credential); err != nil {
-		return err
+	if cfg.AutoDisable {
+		if err := s.selector.disableAccount(ctx, credential); err != nil {
+			return err
+		}
+		s.logger.Info("quality_degraded_disabled", "request_id", record.RequestID, "account_id", credential.ID, "class", class, "output_tps", tps)
+		return nil
 	}
-	s.logger.Info("quality_degraded_disabled", "request_id", record.RequestID, "account_id", credential.ID, "class", class, "output_tps", tps)
+	if record.ReasoningTokens <= 0 {
+		s.applyMissingThinkingPenalty(ctx, record.RequestID, credential, cfg.AccountCooldown, false)
+	}
 	return nil
 }
 

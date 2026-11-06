@@ -1259,6 +1259,9 @@ func (s *Selector) markMissingThinking(ctx context.Context, credential account.C
 		FailureCount: credential.FailureCount, CooldownUntil: &until, HealthMarker: account.LastErrorMissingThinking,
 	})
 	s.evictCandidate(credential.Provider, credential.ID)
+	if s.sticky != nil {
+		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+	}
 	return missingThinkingPenaltyCooled, nil
 }
 

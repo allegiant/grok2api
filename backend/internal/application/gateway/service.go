@@ -1634,7 +1634,7 @@ attemptLoop:
 					continue
 				}
 				response.Body = replay
-				hasNextAccount := qualityCrossAccountReplay && attemptPolicy.hasNext(attempt) && qualityAccountAttempts < holdCfg.MaxAttempts
+				hasNextAccount := qualityCrossAccountReplay && peekUsage.NumServerSideToolsUsed == 0 && attemptPolicy.hasNext(attempt) && qualityAccountAttempts < holdCfg.MaxAttempts
 				if hasNextAccount {
 					hasNextAccount = selection != nil && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
 				}
@@ -1645,6 +1645,8 @@ attemptLoop:
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
 					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider)
+					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
+				} else if verdict == QualityWithhold && commit.Action == QualityActionDeliverLast {
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
 				}
 				switch commit.Action {

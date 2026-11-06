@@ -20,7 +20,7 @@ const (
 	qualityProtocolAnthropic           = "anthropic"
 	qualityReasoningSSEComment         = ": grok2api-reasoning-start"
 	qualityReasoningEvidenceSSEComment = ": grok2api-reasoning-evidence"
-	qualityHoldMaxBufferBytes          = 4 << 20
+	qualityHoldMaxBufferBytes          = 8 << 20
 )
 
 type qualityScanState struct {
@@ -185,7 +185,7 @@ func ObserveQualityChunk(state *qualityScanState, chunk []byte) {
 	for {
 		index := bytes.IndexByte(state.pending, '\n')
 		if index < 0 {
-			if len(state.pending) > 1<<20 {
+			if len(state.pending) > qualityHoldMaxBufferBytes {
 				state.pending = nil
 			}
 			return
@@ -292,14 +292,97 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 }
 
 type qualityResponsesOutputItem struct {
-	ID               string `json:"id"`
-	Type             string `json:"type"`
-	EncryptedContent string `json:"encrypted_content"`
-	Content          []struct {
-		Type    string `json:"type"`
-		Text    string `json:"text"`
-		Refusal string `json:"refusal"`
-	} `json:"content"`
+	ID               string          `json:"id"`
+	Type             string          `json:"type"`
+	EncryptedContent string          `json:"encrypted_content"`
+	Arguments        string          `json:"arguments"`
+	Input            string          `json:"input"`
+	Command          string          `json:"command"`
+	Content          json.RawMessage `json:"content"`
+}
+
+type qualityResponsesUsage struct {
+	OutputTokens            int64 `json:"output_tokens"`
+	OutputTokensCamel       int64 `json:"outputTokens"`
+	CompletionTokens        int64 `json:"completion_tokens"`
+	CompletionTokensCamel   int64 `json:"completionTokens"`
+	InputTokens             int64 `json:"input_tokens"`
+	InputTokensCamel        int64 `json:"inputTokens"`
+	PromptTokens            int64 `json:"prompt_tokens"`
+	PromptTokensCamel       int64 `json:"promptTokens"`
+	TotalTokens             int64 `json:"total_tokens"`
+	TotalTokensCamel        int64 `json:"totalTokens"`
+	ReasoningTokens         int64 `json:"reasoning_tokens"`
+	ReasoningTokensCamel    int64 `json:"reasoningTokens"`
+	ThinkingTokens          int64 `json:"thinking_tokens"`
+	ThinkingTokensCamel     int64 `json:"thinkingTokens"`
+	NumServerSideToolsUsed  int64 `json:"num_server_side_tools_used"`
+	NumServerSideToolsCamel int64 `json:"numServerSideToolsUsed"`
+	OutputTokensDetails     struct {
+		ReasoningTokens      int64 `json:"reasoning_tokens"`
+		ReasoningTokensCamel int64 `json:"reasoningTokens"`
+		ThinkingTokens       int64 `json:"thinking_tokens"`
+		ThinkingTokensCamel  int64 `json:"thinkingTokens"`
+	} `json:"output_tokens_details"`
+	OutputTokensDetailsCamel struct {
+		ReasoningTokens      int64 `json:"reasoning_tokens"`
+		ReasoningTokensCamel int64 `json:"reasoningTokens"`
+		ThinkingTokens       int64 `json:"thinking_tokens"`
+		ThinkingTokensCamel  int64 `json:"thinkingTokens"`
+	} `json:"outputTokensDetails"`
+	CompletionTokensDetails struct {
+		ReasoningTokens      int64 `json:"reasoning_tokens"`
+		ReasoningTokensCamel int64 `json:"reasoningTokens"`
+	} `json:"completion_tokens_details"`
+}
+
+func (u *qualityResponsesUsage) applyTo(state *qualityScanState, model string) {
+	if u == nil || state == nil {
+		return
+	}
+	input := firstPositiveInt64(u.InputTokens, u.InputTokensCamel, u.PromptTokens, u.PromptTokensCamel)
+	output := firstPositiveInt64(u.OutputTokens, u.OutputTokensCamel, u.CompletionTokens, u.CompletionTokensCamel)
+	total := firstPositiveInt64(u.TotalTokens, u.TotalTokensCamel)
+	if total == 0 && (input > 0 || output > 0) {
+		total = input + output
+	}
+	reasoning := firstPositiveInt64(
+		u.OutputTokensDetails.ReasoningTokens,
+		u.OutputTokensDetails.ReasoningTokensCamel,
+		u.OutputTokensDetails.ThinkingTokens,
+		u.OutputTokensDetails.ThinkingTokensCamel,
+		u.OutputTokensDetailsCamel.ReasoningTokens,
+		u.OutputTokensDetailsCamel.ReasoningTokensCamel,
+		u.OutputTokensDetailsCamel.ThinkingTokens,
+		u.OutputTokensDetailsCamel.ThinkingTokensCamel,
+		u.CompletionTokensDetails.ReasoningTokens,
+		u.CompletionTokensDetails.ReasoningTokensCamel,
+		u.ReasoningTokens,
+		u.ReasoningTokensCamel,
+		u.ThinkingTokens,
+		u.ThinkingTokensCamel,
+	)
+	serverTools := firstPositiveInt64(u.NumServerSideToolsUsed, u.NumServerSideToolsCamel)
+	state.usage.Reported = true
+	state.usage.InputTokens = input
+	state.usage.OutputTokens = output
+	state.usage.ReasoningTokens = reasoning
+	state.usage.TotalTokens = total
+	state.usage.NumServerSideToolsUsed = serverTools
+	if model != "" {
+		state.usage.ResponseModel = model
+	}
+	state.outputTokens = output
+	state.reasoningTokens = reasoning
+}
+
+func firstPositiveInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func noteEncryptedBytes(state *qualityScanState, blob string) {
@@ -320,64 +403,63 @@ func noteResponsesReasoningItem(state *qualityScanState, item qualityResponsesOu
 
 func observeQualityResponses(state *qualityScanState, payload []byte) {
 	var event struct {
-		Type     string                     `json:"type"`
-		Delta    string                     `json:"delta"`
-		Item     qualityResponsesOutputItem `json:"item"`
+		Type     string                 `json:"type"`
+		Delta    json.RawMessage        `json:"delta"`
+		Item     json.RawMessage        `json:"item"`
+		Usage    *qualityResponsesUsage `json:"usage"`
 		Response *struct {
-			ID     string                       `json:"id"`
-			Model  string                       `json:"model"`
-			Output []qualityResponsesOutputItem `json:"output"`
-			Usage  *struct {
-				OutputTokens        int64 `json:"output_tokens"`
-				InputTokens         int64 `json:"input_tokens"`
-				TotalTokens         int64 `json:"total_tokens"`
-				OutputTokensDetails struct {
-					ReasoningTokens int64 `json:"reasoning_tokens"`
-				} `json:"output_tokens_details"`
-			} `json:"usage"`
+			ID     string                 `json:"id"`
+			Model  string                 `json:"model"`
+			Output []json.RawMessage      `json:"output"`
+			Usage  *qualityResponsesUsage `json:"usage"`
 		} `json:"response"`
 	}
 	if json.Unmarshal(payload, &event) != nil {
 		return
 	}
+	deltaText := ""
+	if len(event.Delta) > 0 {
+		_ = json.Unmarshal(event.Delta, &deltaText)
+	}
 	switch event.Type {
 	case "response.completed", "response.incomplete", "response.failed":
 		state.terminal = true
 	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
-		if strings.TrimSpace(event.Delta) != "" {
+		if strings.TrimSpace(deltaText) != "" {
 			state.hasThinking = true
 		}
 	case "response.output_item.added", "response.output_item.done":
-		noteResponsesReasoningItem(state, event.Item)
-		state.aggregateRunes = max(state.aggregateRunes, observeQualityResponsesOutputItem(state, event.Item))
+		var item qualityResponsesOutputItem
+		if len(event.Item) > 0 && json.Unmarshal(event.Item, &item) == nil {
+			noteResponsesReasoningItem(state, item)
+			state.aggregateRunes = max(state.aggregateRunes, observeQualityResponsesOutputItem(state, item))
+		}
 	case "response.output_text.delta":
-		if event.Delta != "" {
-			noteVisibleContent(state, event.Delta)
+		if deltaText != "" {
+			noteVisibleContent(state, deltaText)
 		}
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.mcp_call_arguments.delta":
-		if event.Delta != "" {
+		if deltaText != "" {
 			state.semanticOutput = true
 		}
+	}
+	if event.Usage != nil && (event.Response == nil || event.Response.Usage == nil) {
+		event.Usage.applyTo(state, "")
 	}
 	if event.Response != nil {
 		if state.responseID == "" {
 			state.responseID = event.Response.ID
 		}
-		for _, item := range event.Response.Output {
-			noteResponsesReasoningItem(state, item)
-		}
 		if event.Response.Usage != nil {
-			state.usage.Reported = true
-			state.usage.InputTokens = event.Response.Usage.InputTokens
-			state.usage.OutputTokens = event.Response.Usage.OutputTokens
-			state.usage.ReasoningTokens = event.Response.Usage.OutputTokensDetails.ReasoningTokens
-			state.usage.TotalTokens = event.Response.Usage.TotalTokens
-			state.usage.ResponseModel = event.Response.Model
-			state.outputTokens = event.Response.Usage.OutputTokens
-			state.reasoningTokens = event.Response.Usage.OutputTokensDetails.ReasoningTokens
+			event.Response.Usage.applyTo(state, event.Response.Model)
 		}
 		aggregateRunes := 0
-		for _, item := range event.Response.Output {
+		for _, rawItem := range event.Response.Output {
+			var item qualityResponsesOutputItem
+			if json.Unmarshal(rawItem, &item) != nil {
+				continue
+			}
+			noteResponsesReasoningItem(state, item)
 			aggregateRunes += observeQualityResponsesOutputItem(state, item)
 		}
 		state.aggregateRunes = max(state.aggregateRunes, aggregateRunes)
@@ -393,18 +475,36 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 	case "", "reasoning":
 		return 0
 	case "message":
-		for _, content := range item.Content {
-			text := content.Text
-			if text == "" {
-				text = content.Refusal
-			}
-			if text != "" {
-				visibleRunes += utf8.RuneCountInString(text)
+		if len(item.Content) == 0 {
+			return 0
+		}
+		var plainText string
+		if json.Unmarshal(item.Content, &plainText) == nil {
+			if plainText != "" {
+				visibleRunes += utf8.RuneCountInString(plainText)
 				state.semanticOutput = true
-				continue
 			}
-			if content.Type != "" && content.Type != "output_text" && content.Type != "refusal" {
-				state.semanticOutput = true
+			return visibleRunes
+		}
+		var parts []struct {
+			Type    string `json:"type"`
+			Text    string `json:"text"`
+			Refusal string `json:"refusal"`
+		}
+		if json.Unmarshal(item.Content, &parts) == nil {
+			for _, content := range parts {
+				text := content.Text
+				if text == "" {
+					text = content.Refusal
+				}
+				if text != "" {
+					visibleRunes += utf8.RuneCountInString(text)
+					state.semanticOutput = true
+					continue
+				}
+				if content.Type != "" && content.Type != "output_text" && content.Type != "refusal" {
+					state.semanticOutput = true
+				}
 			}
 		}
 	default:
@@ -565,8 +665,11 @@ func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *quality
 	}
 	state.terminal = true
 	signals := state.signals()
-	if !signals.HasThinking && signals.ReasoningTokens <= 0 && signals.OutputTokens <= 0 && signals.VisibleTokens <= 0 {
+	if !qualityHasValidThinking(signals) && signals.ReasoningTokens <= 0 && signals.OutputTokens <= 0 && signals.VisibleTokens <= 0 {
 		if state.semanticOutput {
+			if signals.ReasoningStarted || signals.EncryptedBytes > 0 {
+				return newPrefixReplay(held, pump), QualityWithhold, state.usage, state.responseID, nil
+			}
 			return newPrefixReplay(held, pump), QualityDeliver, state.usage, state.responseID, nil
 		}
 		return newPrefixReplay(held, pump), QualityWait, state.usage, state.responseID, errQualityEmptyStream

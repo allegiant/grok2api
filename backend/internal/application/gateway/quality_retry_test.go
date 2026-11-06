@@ -1547,6 +1547,14 @@ func TestCanReplayQualityHoldAcrossAccounts(t *testing.T) {
 	if canReplayQualityHoldAcrossAccounts(hosted, nil) {
 		t.Fatal("hosted tool must not be replayed across accounts")
 	}
+	tuiSearch := Input{
+		Body:            []byte(`{"tools":[{"type":"web_search"},{"type":"x_search"}],"input":"hello"}`),
+		PromptCacheSeed: "01a1ac2f-4548-7fb3-bfbe-fbeaac6a5dec",
+		Headers:         map[string][]string{"User-Agent": {"grok-pager/1.0.77 grok-shell/1.0.77 (windows; x86_64)"}},
+	}
+	if !canReplayQualityHoldAcrossAccounts(tuiSearch, nil) {
+		t.Fatal("Grok TUI session with search declarations must allow cross-account retry when 0-thinking is withheld")
+	}
 	clientTool := Input{Body: []byte(`{"tools":[{"type":"function","name":"read_file"}],"input":"hello"}`)}
 	if !canReplayQualityHoldAcrossAccounts(clientTool, nil) {
 		t.Fatal("client-executed tool declaration is safe to retry before delivery")
