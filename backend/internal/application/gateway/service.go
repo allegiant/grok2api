@@ -1207,7 +1207,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			return
 		}
 		if recordDegraded {
-			s.recordQualityDegraded(ctx, auditBase, fallback.credential, fallback.usage, startedAt, egressTrace, route.Provider)
+			s.recordQualityDegraded(ctx, auditBase, fallback.credential, fallback.usage, fallback.upstreamStartedAt, egressTrace, route.Provider)
 			failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt)
 		}
 		_ = fallback.response.Body.Close()
@@ -1644,7 +1644,7 @@ attemptLoop:
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
-					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider)
+					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, responseStartedAt, egressTrace, route.Provider)
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
 				} else if verdict == QualityWithhold && commit.Action == QualityActionDeliverLast {
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
@@ -1666,7 +1666,7 @@ attemptLoop:
 						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
 						Cause: errQualityDegraded,
 					}
-					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "reasoning_tokens", peekUsage.ReasoningTokens)
 					continue
 				case QualityActionReject:
 					_ = response.Body.Close()
@@ -1677,11 +1677,11 @@ attemptLoop:
 						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
 						Cause: errQualityDegraded,
 					}
-					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID)
+					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID, "output_tokens", peekUsage.OutputTokens, "reasoning_tokens", peekUsage.ReasoningTokens)
 					break attemptLoop
 				case QualityActionDeliverLast:
 					discardFallback(true)
-					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "reasoning_tokens", peekUsage.ReasoningTokens)
 				case QualityActionDeliver:
 					discardFallback(true)
 				}

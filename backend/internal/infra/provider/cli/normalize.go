@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -102,11 +103,11 @@ func normalizeBuildRequestPayloadWithMetadata(payload map[string]json.RawMessage
 		changed = true
 	}
 	// grok-build 1.0.4 always requests a concise reasoning summary from its
-	// Responses backend, even when it uses the model's default effort. Chat
-	// Completions has no separate summary parameter, so make that Build-specific
-	// compatibility contract explicit without changing native Responses,
-	// Console, or Web semantics.
-	if operation == conversation.OperationChat {
+	// Responses backend, even when it uses the model's default effort. Default
+	// summary=concise for Build Chat and reasoning-capable Responses requests
+	// when the caller did not specify a summary, so upstream streams reasoning
+	// summary deltas instead of silent thinking.
+	if shouldDefaultBuildReasoningSummary(payload, model, operation) {
 		var reasoning map[string]json.RawMessage
 		if raw := payload["reasoning"]; !isEmptyJSON(raw) {
 			if err := json.Unmarshal(raw, &reasoning); err != nil {
@@ -128,6 +129,23 @@ func normalizeBuildRequestPayloadWithMetadata(payload map[string]json.RawMessage
 	}
 	updateBuildReasoningMetadata(payload, model, requestedEffort, metadata)
 	return changed || defaultsChanged, nil
+}
+
+func shouldDefaultBuildReasoningSummary(payload map[string]json.RawMessage, model, operation string) bool {
+	if modeldomain.IsGrokComposerModel(model) {
+		return false
+	}
+	if effort, ok := buildReasoningEffort(payload); ok && strings.EqualFold(strings.TrimSpace(effort), modeldomain.ReasoningEffortNone) {
+		return false
+	}
+	switch operation {
+	case conversation.OperationChat:
+		return true
+	case "", conversation.OperationResponses:
+		return hasRecognizedBuildReasoningEffort(payload) || modeldomain.SupportsReasoningForProvider(accountdomain.ProviderBuild, model)
+	default:
+		return false
+	}
 }
 
 func hasRecognizedBuildReasoningEffort(payload map[string]json.RawMessage) bool {

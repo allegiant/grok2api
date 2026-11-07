@@ -3,9 +3,11 @@ package conversation
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -73,6 +75,7 @@ type streamConverter struct {
 	thinkingIndex          int
 	thinkingItemID         string
 	chatReasoningMark      bool
+	reasoningDeltaMark     bool
 	nextIndex              int
 	tools                  map[string]streamTool
 	webSearch              []webSearchCall
@@ -85,6 +88,7 @@ type streamConverter struct {
 	stopSequence           string
 	refused                bool
 	reasoningEvidenceBytes int
+	reasoningEvidenceValid bool
 	reasoningItems         map[string]*reasoningStreamState
 	reasoningOrder         []string
 	activeReasoningID      string
@@ -166,18 +170,74 @@ func newStreamConverter(writer io.Writer, operation string, options ResponseOpti
 // for the request-path quality scanner after protocol conversion. SSE clients
 // ignore comments, so Chat and Messages public event payloads remain unchanged.
 func (c *streamConverter) markReasoningEvidence(encrypted string) error {
-	byteCount := len(strings.TrimSpace(encrypted))
-	if byteCount <= c.reasoningEvidenceBytes {
+	trimmed := strings.TrimSpace(encrypted)
+	byteCount := len(trimmed)
+	valid := isValidGrokEncryptedContent(trimmed)
+	if byteCount <= c.reasoningEvidenceBytes && (!valid || c.reasoningEvidenceValid) {
 		return nil
 	}
 	if err := c.start(); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(c.writer, ": grok2api-reasoning-evidence %d\n\n", byteCount); err != nil {
+	if valid {
+		if _, err := fmt.Fprintf(c.writer, ": grok2api-reasoning-evidence %d valid\n\n", byteCount); err != nil {
+			return err
+		}
+		c.reasoningEvidenceValid = true
+	} else {
+		if _, err := fmt.Fprintf(c.writer, ": grok2api-reasoning-evidence %d\n\n", byteCount); err != nil {
+			return err
+		}
+	}
+	if byteCount > c.reasoningEvidenceBytes {
+		c.reasoningEvidenceBytes = byteCount
+	}
+	return nil
+}
+
+func (c *streamConverter) markReasoningDelta() error {
+	if c.reasoningDeltaMark {
+		return nil
+	}
+	if err := c.start(); err != nil {
 		return err
 	}
-	c.reasoningEvidenceBytes = byteCount
+	if _, err := io.WriteString(c.writer, ": grok2api-reasoning-delta\n\n"); err != nil {
+		return err
+	}
+	c.reasoningDeltaMark = true
 	return nil
+}
+
+func isValidGrokEncryptedContent(value string) bool {
+	if value == "" || value != strings.TrimSpace(value) || len(value) > 8<<20 {
+		return false
+	}
+	if strings.HasPrefix(value, "gAAAA") || strings.Contains(value, "=") {
+		return false
+	}
+	decoded, err := base64.RawStdEncoding.DecodeString(value)
+	if err != nil || len(decoded) < 50 {
+		return false
+	}
+	var counts [256]int
+	for _, b := range decoded {
+		counts[b]++
+	}
+	size := float64(len(decoded))
+	entropy := 0.0
+	for _, count := range counts {
+		if count == 0 {
+			continue
+		}
+		p := float64(count) / size
+		entropy -= p * math.Log2(p)
+	}
+	maxSymbols := min(len(decoded), 256)
+	if maxSymbols <= 1 {
+		return false
+	}
+	return entropy/math.Log2(float64(maxSymbols)) >= 0.85
 }
 
 // noteWebSearch records a Build web_search_call. Emission is deferred to doneMessages
@@ -677,7 +737,13 @@ func (c *streamConverter) reasoningTextDelta(itemID, delta string) error {
 // reasoningLiveDelta emits the first reasoning source in real time and drops
 // the other. Build currently streams summary only; Console may also send raw.
 func (c *streamConverter) reasoningLiveDelta(itemID, delta, source string) error {
-	if delta == "" || !c.reasoningOutputEnabled() {
+	if delta == "" {
+		return nil
+	}
+	if !c.reasoningOutputEnabled() {
+		if strings.TrimSpace(delta) != "" {
+			return c.markReasoningDelta()
+		}
 		return nil
 	}
 	_, state := c.ensureReasoningState(itemID)

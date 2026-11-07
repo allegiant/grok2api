@@ -3,8 +3,10 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +21,7 @@ const (
 	qualityProtocolResponses           = "responses"
 	qualityProtocolAnthropic           = "anthropic"
 	qualityReasoningSSEComment         = ": grok2api-reasoning-start"
+	qualityReasoningDeltaSSEComment    = ": grok2api-reasoning-delta"
 	qualityReasoningEvidenceSSEComment = ": grok2api-reasoning-evidence"
 	qualityHoldMaxBufferBytes          = 8 << 20
 )
@@ -34,6 +37,7 @@ type qualityScanState struct {
 	reasoningTokens                 int64
 	outputTokens                    int64
 	encryptedBytes                  int
+	validEncryptedContent           bool
 	minEncryptedBytes               int
 	encryptedBytesPerReasoningToken int
 	usage                           Usage
@@ -152,6 +156,15 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 	// the ciphertext floor (default 256 bytes, or 4 bytes per reasoning token).
 	reasoningTokens := max(s.reasoningTokens, s.usage.ReasoningTokens)
 	floor := encryptedThinkingFloor(s.minEncryptedBytes, s.encryptedBytesPerReasoningToken, reasoningTokens)
+	if s.validEncryptedContent && reasoningTokens > 0 {
+		minFloor := int64(s.minEncryptedBytes)
+		if minFloor <= 0 {
+			minFloor = defaultMinEncryptedBytes
+		}
+		if int64(s.encryptedBytes) >= minFloor {
+			floor = minFloor
+		}
+	}
 	hasThinking := s.hasThinking || int64(s.encryptedBytes) >= floor
 	firstVisible := !s.firstVisibleAt.IsZero()
 	var flushMS int64
@@ -200,14 +213,26 @@ func ObserveQualityChunk(state *qualityScanState, chunk []byte) {
 			state.reasoningStarted = true
 			continue
 		}
+		if bytes.Equal(line, []byte(qualityReasoningDeltaSSEComment)) {
+			state.reasoningStarted = true
+			state.hasThinking = true
+			continue
+		}
 		if bytes.HasPrefix(line, []byte(qualityReasoningEvidenceSSEComment)) {
 			// Protocol converters cannot expose encrypted_content in every public
 			// JSON contract. This internal SSE comment preserves its byte length so
 			// short stubs cannot bypass the ciphertext floor.
 			state.reasoningStarted = true
-			value := strings.TrimSpace(strings.TrimPrefix(string(line), qualityReasoningEvidenceSSEComment))
-			if count, err := strconv.Atoi(value); err == nil && count > state.encryptedBytes {
-				state.encryptedBytes = count
+			fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(string(line), qualityReasoningEvidenceSSEComment)))
+			if len(fields) > 0 {
+				if count, err := strconv.Atoi(fields[0]); err == nil && count > state.encryptedBytes {
+					state.encryptedBytes = count
+				}
+				for _, flag := range fields[1:] {
+					if strings.EqualFold(flag, "valid") {
+						state.validEncryptedContent = true
+					}
+				}
 			}
 			continue
 		}
@@ -299,6 +324,7 @@ type qualityResponsesOutputItem struct {
 	Input            string          `json:"input"`
 	Command          string          `json:"command"`
 	Content          json.RawMessage `json:"content"`
+	Summary          json.RawMessage `json:"summary"`
 }
 
 type qualityResponsesUsage struct {
@@ -386,9 +412,65 @@ func firstPositiveInt64(values ...int64) int64 {
 }
 
 func noteEncryptedBytes(state *qualityScanState, blob string) {
-	if n := len(strings.TrimSpace(blob)); n > state.encryptedBytes {
+	trimmed := strings.TrimSpace(blob)
+	if n := len(trimmed); n > state.encryptedBytes {
 		state.encryptedBytes = n
 	}
+	if isValidGrokEncryptedContent(trimmed) {
+		state.validEncryptedContent = true
+	}
+}
+
+func isValidGrokEncryptedContent(value string) bool {
+	if value == "" || value != strings.TrimSpace(value) || len(value) > qualityHoldMaxBufferBytes {
+		return false
+	}
+	if strings.HasPrefix(value, "gAAAA") || strings.Contains(value, "=") {
+		return false
+	}
+	decoded, err := base64.RawStdEncoding.DecodeString(value)
+	if err != nil || len(decoded) < 50 {
+		return false
+	}
+	var counts [256]int
+	for _, b := range decoded {
+		counts[b]++
+	}
+	size := float64(len(decoded))
+	entropy := 0.0
+	for _, count := range counts {
+		if count == 0 {
+			continue
+		}
+		p := float64(count) / size
+		entropy -= p * math.Log2(p)
+	}
+	maxSymbols := min(len(decoded), 256)
+	if maxSymbols <= 1 {
+		return false
+	}
+	return entropy/math.Log2(float64(maxSymbols)) >= 0.85
+}
+
+func responsesReasoningPartsHaveText(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var plain string
+	if json.Unmarshal(raw, &plain) == nil {
+		return strings.TrimSpace(plain) != ""
+	}
+	var parts []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) == nil {
+		for _, part := range parts {
+			if strings.TrimSpace(part.Text) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func noteResponsesReasoningItem(state *qualityScanState, item qualityResponsesOutputItem) {
@@ -398,6 +480,9 @@ func noteResponsesReasoningItem(state *qualityScanState, item qualityResponsesOu
 	if strings.TrimSpace(item.ID) != "" {
 		state.reasoningStarted = true
 	}
+	if responsesReasoningPartsHaveText(item.Summary) || responsesReasoningPartsHaveText(item.Content) {
+		state.hasThinking = true
+	}
 	noteEncryptedBytes(state, item.EncryptedContent)
 }
 
@@ -405,6 +490,8 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 	var event struct {
 		Type     string                 `json:"type"`
 		Delta    json.RawMessage        `json:"delta"`
+		Text     string                 `json:"text"`
+		Part     json.RawMessage        `json:"part"`
 		Item     json.RawMessage        `json:"item"`
 		Usage    *qualityResponsesUsage `json:"usage"`
 		Response *struct {
@@ -426,6 +513,14 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 		state.terminal = true
 	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
 		if strings.TrimSpace(deltaText) != "" {
+			state.hasThinking = true
+		}
+	case "response.reasoning_text.done", "response.reasoning_summary_text.done":
+		if strings.TrimSpace(event.Text) != "" || strings.TrimSpace(deltaText) != "" {
+			state.hasThinking = true
+		}
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		if responsesReasoningPartsHaveText(event.Part) {
 			state.hasThinking = true
 		}
 	case "response.output_item.added", "response.output_item.done":

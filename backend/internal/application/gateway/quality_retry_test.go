@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -2040,5 +2042,50 @@ func TestNormalizeQualityRetryDefaults(t *testing.T) {
 	got := normalizeQualityRetry(QualityRetryRuntime{Enabled: true})
 	if !got.Enabled || got.MaxAttempts != 6 || got.MinOutputTokens != 8 || got.OnExhausted != qualityRetryFailClosed || got.HoldTimeout != 30*time.Second || got.AccountCooldown != 12*time.Hour || got.IdleAccountCooldown != 15*time.Minute || got.MinEncryptedBytes != defaultMinEncryptedBytes || got.EncryptedBytesPerReasoningToken != defaultEncryptedBytesPerReasoningToken {
 		t.Fatalf("defaults = %#v", got)
+	}
+}
+
+func testValidGrokEncryptedContent(seed byte) string {
+	buffer := make([]byte, 0, 256)
+	for index := 0; len(buffer) < 256; index++ {
+		digest := sha256.Sum256([]byte{seed, byte(index), byte(index >> 8)})
+		buffer = append(buffer, digest[:]...)
+	}
+	return base64.RawStdEncoding.EncodeToString(buffer[:256])
+}
+
+func TestObserveQualityChunkValidGrokEncryptedContentAndDoneSummaryDeliver(t *testing.T) {
+	t.Parallel()
+	validCipher := testValidGrokEncryptedContent(7)
+	// Compact high-entropy Grok Build encrypted_content (~342 bytes) with 596 reasoning tokens.
+	cipherOnly := qualityScanState{protocol: qualityProtocolResponses}
+	ObserveQualityChunk(&cipherOnly, []byte(sse(
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"`+validCipher+`"}}`,
+		`data: {"type":"response.output_text.delta","delta":"`+strings.Repeat("word ", 40)+`"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","model":"grok-4.7","usage":{"output_tokens":638,"output_tokens_details":{"reasoning_tokens":596}}}}`,
+	)))
+	cipherSig := cipherOnly.signals()
+	if !cipherSig.HasThinking || cipherSig.ReasoningTokens != 596 {
+		t.Fatalf("valid Grok Build encrypted_content with 596 reasoning tokens must count as thinking: %#v", cipherSig)
+	}
+	if got := ClassifyQualityHold(cipherSig, 8); got != QualityDeliver {
+		t.Fatalf("valid Grok Build encrypted_content at terminal got %s, want deliver (%#v)", got, cipherSig)
+	}
+
+	// Done-only summary text inside output_item.done without prior .delta frame.
+	doneSummary := qualityScanState{protocol: qualityProtocolResponses}
+	ObserveQualityChunk(&doneSummary, []byte(sse(
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"concise thought summary"}]}}`,
+		`data: {"type":"response.output_text.delta","delta":"`+strings.Repeat("word ", 40)+`"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","model":"grok-4.7","usage":{"output_tokens":638,"output_tokens_details":{"reasoning_tokens":596}}}}`,
+	)))
+	doneSig := doneSummary.signals()
+	if !doneSig.HasThinking || !doneSig.HasReasoningDelta {
+		t.Fatalf("output_item.done summary text must count as thinking: %#v", doneSig)
+	}
+	if got := ClassifyQualityHold(doneSig, 8); got != QualityDeliver {
+		t.Fatalf("output_item.done summary text got %s, want deliver (%#v)", got, doneSig)
 	}
 }
