@@ -634,6 +634,66 @@ func jsonStringEquals(raw json.RawMessage, want string) bool {
 	return json.Unmarshal(raw, &value) == nil && strings.EqualFold(strings.TrimSpace(value), want)
 }
 
+func qualityRequestIsMultiTurnContinuation(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil || payload == nil {
+		return false
+	}
+	var previousID string
+	if raw, ok := payload["previous_response_id"]; ok && json.Unmarshal(raw, &previousID) == nil && strings.TrimSpace(previousID) != "" {
+		return true
+	}
+	if rawInput, ok := payload["input"]; ok {
+		var items []map[string]json.RawMessage
+		if json.Unmarshal(rawInput, &items) == nil {
+			for _, item := range items {
+				var itemType, role string
+				_ = json.Unmarshal(item["type"], &itemType)
+				_ = json.Unmarshal(item["role"], &role)
+				switch strings.ToLower(strings.TrimSpace(itemType)) {
+				case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+					"tool_result", "local_shell_call", "local_shell_call_output", "shell_call", "shell_call_output",
+					"apply_patch_call", "apply_patch_call_output", "web_search_call", "file_search_call",
+					"code_interpreter_call", "mcp_call", "mcp_tool_call_output", "reasoning", "compaction":
+					return true
+				}
+				switch strings.ToLower(strings.TrimSpace(role)) {
+				case "assistant", "tool", "function":
+					return true
+				}
+			}
+		}
+	}
+	if rawMessages, ok := payload["messages"]; ok {
+		var messages []map[string]json.RawMessage
+		if json.Unmarshal(rawMessages, &messages) == nil {
+			for _, msg := range messages {
+				var role string
+				_ = json.Unmarshal(msg["role"], &role)
+				switch strings.ToLower(strings.TrimSpace(role)) {
+				case "assistant", "tool", "function":
+					return true
+				}
+				var blocks []map[string]json.RawMessage
+				if json.Unmarshal(msg["content"], &blocks) == nil {
+					for _, block := range blocks {
+						var blockType string
+						_ = json.Unmarshal(block["type"], &blockType)
+						switch strings.ToLower(strings.TrimSpace(blockType)) {
+						case "tool_use", "tool_result", "thinking", "redacted_thinking":
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (s *Service) applyMissingThinkingPenalty(ctx context.Context, requestID string, credential accountdomain.Credential, cooldown time.Duration, autoDisable bool) {
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
 	defer cancel()

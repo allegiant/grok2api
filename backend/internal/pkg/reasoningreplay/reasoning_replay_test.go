@@ -293,3 +293,72 @@ func TestDiscardCaptureRetainsPreviousReplay(t *testing.T) {
 		t.Fatalf("discarded capture wiped out previous turn replay: %s", updated)
 	}
 }
+
+func TestMultiTurnToolCallsAccumulateAndInjectAllHistoricalReasoning(t *testing.T) {
+	store := memory.NewReasoningReplayStore(100)
+	replay := New(store, Config{Enabled: true, TTL: time.Hour}, slog.Default())
+	ctx := context.Background()
+	enc1 := validEncrypted(31)
+	enc2 := validEncrypted(32)
+	enc3 := validEncrypted(33)
+
+	// Turn 1 completed: [reasoning_1, function_call_1]
+	replay.StoreFromCompleted(ctx, "grok-4.7", "session-multi", []byte(
+		`{"output":[{"type":"reasoning","encrypted_content":"`+enc1+`"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"}]}`,
+	))
+
+	// Turn 2 completed: [reasoning_2, assistant_preamble_2, function_call_2]
+	replay.StoreFromCompleted(ctx, "grok-4.7", "session-multi", []byte(
+		`{"output":[{"type":"reasoning","encrypted_content":"`+enc2+`"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking status"}]},{"type":"function_call","call_id":"call_2","name":"shell","arguments":"{\"cmd\":\"git status\"}"}]}`,
+	))
+
+	// Turn 3 completed: [reasoning_3, function_call_3]
+	replay.StoreFromCompleted(ctx, "grok-4.7", "session-multi", []byte(
+		`{"output":[{"type":"reasoning","encrypted_content":"`+enc3+`"},{"type":"function_call","call_id":"call_3","name":"shell","arguments":"{\"cmd\":\"go test\"}"}]}`,
+	))
+
+	// Turn 4 client request has all 3 historical turns (without encrypted_content, and Turn 3 has a portable summary fallback)
+	turn4Body := []byte(`{"input":[` +
+		`{"type":"message","role":"user","content":"fix the project"},` +
+		`{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},` +
+		`{"type":"function_call_output","call_id":"call_1","output":"main.go"},` +
+		`{"type":"message","role":"assistant","content":"checking status"},` +
+		`{"type":"function_call","call_id":"call_2","name":"shell","arguments":"{\"cmd\":\"git status\"}"},` +
+		`{"type":"function_call_output","call_id":"call_2","output":"clean"},` +
+		`{"type":"message","role":"assistant","content":"Prior model reasoning summary:\nrun tests"},` +
+		`{"type":"function_call","call_id":"call_3","name":"shell","arguments":"{\"cmd\":\"go test\"}"},` +
+		`{"type":"function_call_output","call_id":"call_3","output":"PASS"}` +
+		`]}`)
+
+	updated := replay.Apply(ctx, "grok-4.7", "session-multi", turn4Body)
+	var parsed struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(updated, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	// Expected sequence:
+	// 0: user ("fix the project")
+	// 1: reasoning (enc1)
+	// 2: function_call (call_1)
+	// 3: function_call_output (call_1)
+	// 4: reasoning (enc2)
+	// 5: assistant ("checking status")
+	// 6: function_call (call_2)
+	// 7: function_call_output (call_2)
+	// 8: reasoning (enc3) -- replaced Prior model reasoning summary
+	// 9: function_call (call_3)
+	// 10: function_call_output (call_3)
+	if len(parsed.Input) != 11 {
+		t.Fatalf("expected 11 items after multi-turn replay, got %d: %s", len(parsed.Input), updated)
+	}
+	if parsed.Input[1]["type"] != "reasoning" || parsed.Input[1]["encrypted_content"] != enc1 {
+		t.Fatalf("turn 1 reasoning missing at index 1: %#v", parsed.Input[1])
+	}
+	if parsed.Input[4]["type"] != "reasoning" || parsed.Input[4]["encrypted_content"] != enc2 || parsed.Input[5]["role"] != "assistant" {
+		t.Fatalf("turn 2 reasoning must precede assistant preamble at index 4..5: %#v %#v", parsed.Input[4], parsed.Input[5])
+	}
+	if parsed.Input[8]["type"] != "reasoning" || parsed.Input[8]["encrypted_content"] != enc3 || parsed.Input[9]["type"] != "function_call" {
+		t.Fatalf("turn 3 reasoning must replace portable summary before function_call at index 8..9: %#v %#v", parsed.Input[8], parsed.Input[9])
+	}
+}

@@ -15,6 +15,7 @@ const (
 	minReplayEncryptedEntropy    = 0.85
 	maxReplayEncryptedLen        = 8 << 20
 	maxReplayCaptureBytes        = 8 << 20
+	maxReplayTurnGroups          = 64
 	defaultReasoningReplayTTL    = time.Hour
 )
 
@@ -81,17 +82,12 @@ func (r *ReasoningReplay) Apply(ctx context.Context, model, sessionKey string, b
 		r.logger.Debug("reasoning_replay_miss", "reason", "not_found", "model", model)
 		return body
 	}
-	filtered := filterReplayItemsForInput(body, items)
-	if len(filtered) == 0 {
-		r.logger.Debug("reasoning_replay_miss", "reason", "filtered", "model", model)
+	updated, injected, reason := applyReplayItemsToBody(body, items)
+	if injected == 0 {
+		r.logger.Debug("reasoning_replay_miss", "reason", reason, "model", model)
 		return body
 	}
-	updated, ok := insertReplayItems(body, filtered, items)
-	if !ok {
-		r.logger.Debug("reasoning_replay_miss", "reason", "insert_failed", "model", model)
-		return body
-	}
-	r.logger.Debug("reasoning_replay_hit", "model", model, "injected", len(filtered))
+	r.logger.Debug("reasoning_replay_hit", "model", model, "injected", injected)
 	return updated
 }
 
@@ -109,8 +105,11 @@ func (r *ReasoningReplay) StoreFromCompleted(ctx context.Context, model, session
 		r.logger.Debug("reasoning_replay_store_skipped", "model", model, "reason", "incomplete_payload")
 		return
 	}
+	now := r.now().UTC()
+	existing, _, _ := r.store.Get(ctx, model, sessionKey, now, cfg.TTL)
 	normalized, ok := normalizeReplayItems(items)
-	if !ok {
+	merged := mergeReplayTurnGroups(existing, normalized, ok, maxReplayTurnGroups)
+	if len(merged) == 0 {
 		if err := r.store.Delete(ctx, model, sessionKey); err != nil {
 			r.logger.Warn("reasoning_replay_delete_failed", "model", model, "reason", "no_anchor", "error", err)
 		} else {
@@ -118,12 +117,12 @@ func (r *ReasoningReplay) StoreFromCompleted(ctx context.Context, model, session
 		}
 		return
 	}
-	expiresAt := r.now().UTC().Add(cfg.TTL)
-	if err := r.store.Set(ctx, model, sessionKey, normalized, expiresAt); err != nil {
+	expiresAt := now.Add(cfg.TTL)
+	if err := r.store.Set(ctx, model, sessionKey, merged, expiresAt); err != nil {
 		r.logger.Warn("reasoning_replay_store_failed", "model", model, "error", err)
 		return
 	}
-	r.logger.Debug("reasoning_replay_store", "model", model, "items", len(normalized))
+	r.logger.Debug("reasoning_replay_store", "model", model, "items", len(merged))
 }
 
 // Clear 删除指定会话的回放缓存（compact 成功等）。

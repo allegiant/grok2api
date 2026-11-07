@@ -2106,3 +2106,100 @@ func TestObserveQualityChunkValidGrokEncryptedContentAndDoneSummaryDeliver(t *te
 		t.Fatalf("short valid Grok Build encrypted_content at terminal got %s, want deliver (%#v)", got, shortSig)
 	}
 }
+
+func TestAttemptLoopMultiTurnConsensusDeliversWithoutCoolingAccounts(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-multiturn-consensus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	credentials := make([]accountdomain.Credential, 0, 4)
+	for index, name := range []string{"mt-acct-1", "mt-acct-2", "mt-acct-3", "mt-acct-4"} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+			Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name,
+			EncryptedAccessToken: name, EncryptedRefreshToken: "refresh-" + name,
+			ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+			AuthStatus: accountdomain.AuthStatusActive, Priority: 200 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.7"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.7"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "mt-consensus-key", Prefix: "qmtc", SecretHash: strings.Repeat("c", 64),
+		EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	toolCallNoReasoning := sse(
+		`data: {"type":"response.created","response":{"id":"resp-mt","model":"grok-4.7"}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":""}}`,
+		`data: {"type":"response.function_call_arguments.delta","delta":"{\"cmd\":\"pwd\"}"}`,
+		`data: {"type":"response.output_item.done","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":"{\"cmd\":\"pwd\"}"}}`,
+		`data: {"type":"response.completed","response":{"id":"resp-mt","model":"grok-4.7","usage":{"output_tokens":42,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+	)
+	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
+		credentials[0].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
+		credentials[1].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
+		credentials[2].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
+		credentials[3].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
+	}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 6)
+	service.UpdateQualityRetry(QualityRetryRuntime{
+		Enabled: true, MaxAttempts: 6, MinOutputTokens: 8,
+		OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
+	})
+
+	multiTurnBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-mt-consensus", ClientKey: clientKey, PublicModel: "grok-4.7",
+		Streaming: true, Body: multiTurnBody,
+	})
+	if err != nil {
+		t.Fatalf("multi-turn consensus should deliver instead of returning 503: %v", err)
+	}
+	body, _ := io.ReadAll(result.Body)
+	result.Finalize(Usage{Reported: true, OutputTokens: 42, ReasoningTokens: 0}, "resp-mt", "")
+	_ = result.Body.Close()
+	if !strings.Contains(string(body), `"call_2"`) {
+		t.Fatalf("expected tool call body delivered, got %s", body)
+	}
+	attempts := adapter.Attempts()
+	if len(attempts) != 2 {
+		t.Fatalf("expected consensus after 2 accounts (not burning all 4), got attempts=%v", attempts)
+	}
+	for _, id := range attempts {
+		acct, getErr := accountRepo.Get(ctx, id)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
+			t.Fatalf("account %d should not be cooled down on prompt-induced multi-turn 0-reasoning consensus: %#v", id, acct)
+		}
+	}
+}

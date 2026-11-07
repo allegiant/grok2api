@@ -50,7 +50,9 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 		case "reasoning":
 			converted := sanitizeReasoningInput(item)
 			c.changed = true
-			rewritten = append(rewritten, converted)
+			if converted != nil {
+				rewritten = append(rewritten, converted)
+			}
 		case "file_search_call", "web_search_call", "image_generation_call", "code_interpreter_call",
 			"shell_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response", "mcp_call", "compaction":
 			// These types are part of the native Grok Build Responses InputItem contract.
@@ -208,6 +210,9 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			rewritten = append(rewritten, cloneJSONValue(item))
 		}
 	}
+	if len(rewritten) == 0 && len(items) > 0 {
+		rewritten = append(rewritten, compatibilityBoundaryMessage("A prior model reasoning item was omitted because it has no portable content for Grok Build."))
+	}
 	return rewritten, loadedTools, visibleTools, nil
 }
 
@@ -273,7 +278,7 @@ func sanitizeReasoningInput(item map[string]any) map[string]any {
 	if portable, ok := portableReasoningSummaryMessage(converted); ok {
 		return portable
 	}
-	return compatibilityBoundaryMessage("A prior model reasoning item was omitted because it has no portable content for Grok Build.")
+	return nil
 }
 
 // sanitizeNativeHistoryInput rebuilds history from native Grok Build InputItem fields
