@@ -21,6 +21,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
+	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
 )
 
 type failureAttemptRecorder struct {
@@ -414,6 +415,10 @@ func auditAccountID(id uint64) *uint64 {
 type replayReadCloser struct {
 	io.Reader
 	source io.Closer
+}
+
+func (r *replayReadCloser) DiscardReplayCapture() {
+	reasoningreplay.DiscardCapture(r.source)
 }
 
 func (r *replayReadCloser) Close() error { return r.source.Close() }

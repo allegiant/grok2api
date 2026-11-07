@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
+	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
 )
 
 const (
@@ -118,6 +119,10 @@ func (p *qualityReadPump) Read(dst []byte) (int, error) {
 	return n, nil
 }
 
+func (p *qualityReadPump) DiscardReplayCapture() {
+	reasoningreplay.DiscardCapture(p.source)
+}
+
 func (p *qualityReadPump) Close() error {
 	var err error
 	p.closeOnce.Do(func() {
@@ -156,13 +161,11 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 	// the ciphertext floor (default 256 bytes, or 4 bytes per reasoning token).
 	reasoningTokens := max(s.reasoningTokens, s.usage.ReasoningTokens)
 	floor := encryptedThinkingFloor(s.minEncryptedBytes, s.encryptedBytesPerReasoningToken, reasoningTokens)
-	if s.validEncryptedContent && reasoningTokens > 0 {
-		minFloor := int64(s.minEncryptedBytes)
-		if minFloor <= 0 {
-			minFloor = defaultMinEncryptedBytes
-		}
-		if int64(s.encryptedBytes) >= minFloor {
-			floor = minFloor
+	if s.validEncryptedContent && reasoningTokens > 0 && s.encryptedBytes > 0 {
+		if s.minEncryptedBytes <= defaultMinEncryptedBytes {
+			floor = int64(s.encryptedBytes)
+		} else if int64(s.encryptedBytes) >= int64(s.minEncryptedBytes) {
+			floor = int64(s.minEncryptedBytes)
 		}
 	}
 	hasThinking := s.hasThinking || int64(s.encryptedBytes) >= floor
@@ -718,6 +721,7 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 
 		select {
 		case <-ctx.Done():
+			reasoningreplay.DiscardCapture(pump)
 			_ = pump.Close()
 			return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, ctx.Err())
 		case <-holdTimer.C:
@@ -742,6 +746,7 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 				return finishQualityPeek(&held, pump, &state, cfg)
 			}
 			if result.err != nil {
+				reasoningreplay.DiscardCapture(pump)
 				_ = pump.Close()
 				return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, result.err)
 			}

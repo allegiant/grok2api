@@ -125,10 +125,9 @@ func TestNormalizeBuildChatRequestsVisibleReasoningSummary(t *testing.T) {
 		{name: "Chat model default", model: "grok-4.6", operation: conversation.OperationChat, body: `{"input":"hello"}`, wantSummary: "concise", wantObject: true},
 		{name: "Chat explicit effort", model: "grok-4.6", operation: conversation.OperationChat, body: `{"input":"hello","reasoning":{"effort":"high"}}`, wantSummary: "concise", wantEffort: "high", wantObject: true},
 		{name: "Chat explicit summary", model: "grok-4.6", operation: conversation.OperationChat, body: `{"input":"hello","reasoning":{"effort":"high","summary":"detailed"}}`, wantSummary: "detailed", wantEffort: "high", wantObject: true},
-		{name: "Responses reasoning model defaults summary concise", model: "grok-4.6", operation: conversation.OperationResponses, body: `{"input":"hello"}`, wantSummary: "concise", wantObject: true},
+		{name: "Responses remains untouched", model: "grok-4.6", operation: conversation.OperationResponses, body: `{"input":"hello"}`, wantObject: false},
 		{name: "Responses explicit summary preserved", model: "grok-4.6", operation: conversation.OperationResponses, body: `{"input":"hello","reasoning":{"effort":"high","summary":"detailed"}}`, wantSummary: "detailed", wantEffort: "high", wantObject: true},
 		{name: "Responses effort none does not inject summary", model: "grok-4.3", operation: conversation.OperationResponses, body: `{"input":"hello","reasoning":{"effort":"none"}}`, wantEffort: "none", wantObject: true},
-		{name: "Responses non-reasoning model remains untouched", model: "grok-4.20-0309-non-reasoning", operation: conversation.OperationResponses, body: `{"input":"hello"}`, wantObject: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

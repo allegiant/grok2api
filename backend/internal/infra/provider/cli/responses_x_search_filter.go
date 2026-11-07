@@ -60,8 +60,11 @@ func filterBuildPromptCacheResponse(response *http.Response, streaming bool, rou
 
 func (f *buildXSearchResponseFilter) stream(source io.ReadCloser) io.ReadCloser {
 	reader, writer := io.Pipe()
+	stream := &compatibleSSEPipeReadCloser{
+		reader: reader,
+		source: source,
+	}
 	go func() {
-		defer source.Close()
 		err := consumeCompatibleSSE(source, func(event compatibleSSEEvent) error {
 			if !event.HasData() {
 				return event.writeTo(writer)
@@ -80,9 +83,12 @@ func (f *buildXSearchResponseFilter) stream(source io.ReadCloser) io.ReadCloser 
 			event.SetData(filtered)
 			return event.writeTo(writer)
 		})
+		if err != nil {
+			_ = stream.closeSource()
+		}
 		_ = writer.CloseWithError(err)
 	}()
-	return reader
+	return stream
 }
 
 func (f *buildXSearchResponseFilter) filterJSON(body []byte) ([]byte, error) {

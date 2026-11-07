@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
+
+	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
 )
 
 const (
@@ -36,13 +39,49 @@ func (c *responsesToolCompatibility) normalizeResponseJSON(body []byte) ([]byte,
 	return converted, nil
 }
 
+type compatibleSSEPipeReadCloser struct {
+	reader          *io.PipeReader
+	source          io.ReadCloser
+	closeSourceOnce sync.Once
+	sourceCloseErr  error
+}
+
+func (r *compatibleSSEPipeReadCloser) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func (r *compatibleSSEPipeReadCloser) DiscardReplayCapture() {
+	reasoningreplay.DiscardCapture(r.source)
+}
+
+func (r *compatibleSSEPipeReadCloser) Close() error {
+	pipeErr := r.reader.Close()
+	sourceErr := r.closeSource()
+	if pipeErr != nil {
+		return pipeErr
+	}
+	return sourceErr
+}
+
+func (r *compatibleSSEPipeReadCloser) closeSource() error {
+	r.closeSourceOnce.Do(func() {
+		if r.source != nil {
+			r.sourceCloseErr = r.source.Close()
+		}
+	})
+	return r.sourceCloseErr
+}
+
 // normalizeResponseStream applies the Build-to-OpenAI SSE boundary for every
 // Responses stream. Tool rewriting is optional, while BOM removal and private
 // Grok control-event filtering always apply.
 func (c *responsesToolCompatibility) normalizeResponseStream(source io.ReadCloser) io.ReadCloser {
 	reader, writer := io.Pipe()
+	stream := &compatibleSSEPipeReadCloser{
+		reader: reader,
+		source: source,
+	}
 	go func() {
-		defer source.Close()
 		err := consumeCompatibleSSE(source, func(event compatibleSSEEvent) error {
 			if isPrivateBuildControlEvent(event) {
 				return nil
@@ -84,9 +123,12 @@ func (c *responsesToolCompatibility) normalizeResponseStream(source io.ReadClose
 			}
 			return nil
 		})
+		if err != nil {
+			_ = stream.closeSource()
+		}
 		_ = writer.CloseWithError(err)
 	}()
-	return reader
+	return stream
 }
 
 func isPrivateBuildControlEvent(event compatibleSSEEvent) bool {

@@ -32,6 +32,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
+	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
 	"github.com/chenyme/grok2api/backend/internal/pkg/requestmeta"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
@@ -1064,7 +1065,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		timing.markCredential(time.Since(started))
 		return result, err
 	}
-	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time) *Result {
+	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, missingThinkingPenalized bool) *Result {
 		accountID := credential.ID
 		var once sync.Once
 		finalize := func(usage Usage, responseID, errorCode string) {
@@ -1129,10 +1130,12 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				}
 				record.CreatedAt = now
 				applyAuditEgress(&record, egressTrace, route.Provider)
-				if err := budget.run("quality_disable", finalizationHealthBudget, func(stageCtx context.Context) error {
-					return s.applyOutputSpeedPenalty(stageCtx, record, credential, holdCfg, input.ForcedEgressNodeID != 0)
-				}); err != nil {
-					s.logger.Error("quality_degraded_penalty_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", err)
+				if !missingThinkingPenalized || holdCfg.AutoDisable {
+					if err := budget.run("quality_disable", finalizationHealthBudget, func(stageCtx context.Context) error {
+						return s.applyOutputSpeedPenalty(stageCtx, record, credential, holdCfg, input.ForcedEgressNodeID != 0)
+					}); err != nil {
+						s.logger.Error("quality_degraded_penalty_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", err)
+					}
 				}
 				if supportsStoredResponses && operation == audit.OperationResponses && responseID != "" && successful {
 					err := budget.run("response_ownership", finalizationOwnershipBudget, func(stageCtx context.Context) error {
@@ -1210,6 +1213,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			s.recordQualityDegraded(ctx, auditBase, fallback.credential, fallback.usage, fallback.upstreamStartedAt, egressTrace, route.Provider)
 			failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt)
 		}
+		reasoningreplay.DiscardCapture(fallback.response.Body)
 		_ = fallback.response.Body.Close()
 		fallback = nil
 	}
@@ -1597,12 +1601,15 @@ attemptLoop:
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
+			missingThinkingPenalized := false
 			if qualityHoldEnabled {
 				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
 				if peekErr != nil {
 					if replay != nil {
+						reasoningreplay.DiscardCapture(replay)
 						_ = replay.Close()
 					} else {
+						reasoningreplay.DiscardCapture(response.Body)
 						_ = response.Body.Close()
 					}
 					lease.Release()
@@ -1641,6 +1648,7 @@ attemptLoop:
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
 				if verdict == QualityWithhold {
 					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown, holdCfg.AutoDisable)
+					missingThinkingPenalized = true
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
@@ -1657,6 +1665,7 @@ attemptLoop:
 						lease.completeSelectorObservation(true)
 						lease.Release()
 					} else {
+						reasoningreplay.DiscardCapture(response.Body)
 						_ = response.Body.Close()
 						lease.Release()
 					}
@@ -1669,6 +1678,7 @@ attemptLoop:
 					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "reasoning_tokens", peekUsage.ReasoningTokens)
 					continue
 				case QualityActionReject:
+					reasoningreplay.DiscardCapture(response.Body)
 					_ = response.Body.Close()
 					lease.Release()
 					lastErr = errQualityDegraded
@@ -1686,6 +1696,7 @@ attemptLoop:
 					discardFallback(true)
 				}
 				if !commit.KeepBody {
+					reasoningreplay.DiscardCapture(response.Body)
 					_ = response.Body.Close()
 					lease.Release()
 					break attemptLoop
@@ -1700,24 +1711,36 @@ attemptLoop:
 					}
 				}
 			}
+			if fallback != nil && holdCfg.OnExhausted == qualityRetryFailOpen {
+				reasoningreplay.DiscardCapture(response.Body)
+				_ = response.Body.Close()
+				lease.completeSelectorObservation(false)
+				lease.Release()
+				selected := fallback
+				fallback = nil
+				s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
+				return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, true), nil
+			}
+			return handoffResponse(response, lease, credential, responseStartedAt, missingThinkingPenalized), nil
 		}
 		if fallback != nil && holdCfg.OnExhausted == qualityRetryFailOpen {
+			reasoningreplay.DiscardCapture(response.Body)
 			_ = response.Body.Close()
 			lease.completeSelectorObservation(false)
 			lease.Release()
 			selected := fallback
 			fallback = nil
 			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
+			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, true), nil
 		}
-		return handoffResponse(response, lease, credential, responseStartedAt), nil
+		return handoffResponse(response, lease, credential, responseStartedAt, false), nil
 	}
 	if fallback != nil {
 		if ctx.Err() == nil && holdCfg.OnExhausted == qualityRetryFailOpen {
 			selected := fallback
 			fallback = nil
 			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
+			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, true), nil
 		}
 		discardFallback(true)
 	}

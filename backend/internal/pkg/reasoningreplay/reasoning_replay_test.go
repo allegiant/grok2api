@@ -234,3 +234,62 @@ func TestMemoryTTLExpire(t *testing.T) {
 		t.Fatalf("expected expired miss ok=%v err=%v", ok, err)
 	}
 }
+
+func TestApplyInsertsReasoningBeforeExistingFunctionCall(t *testing.T) {
+	store := memory.NewReasoningReplayStore(100)
+	replay := New(store, Config{Enabled: true, TTL: time.Hour}, slog.Default())
+	enc := validEncrypted(21)
+	replay.StoreFromCompleted(context.Background(), "grok-4.7", "session-fc-order", []byte(
+		`{"output":[{"type":"reasoning","encrypted_content":"`+enc+`"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}]}`,
+	))
+
+	// Case 1: Turn 2 input has [user, function_call, function_call_output]
+	body := []byte(`{"input":[{"type":"message","role":"user","content":"run ls"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
+	updated := replay.Apply(context.Background(), "grok-4.7", "session-fc-order", body)
+	var parsed struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(updated, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Input) != 4 {
+		t.Fatalf("expected 4 items, got %d: %s", len(parsed.Input), updated)
+	}
+	if parsed.Input[0]["role"] != "user" || parsed.Input[1]["type"] != "reasoning" || parsed.Input[2]["type"] != "function_call" || parsed.Input[3]["type"] != "function_call_output" {
+		t.Fatalf("unexpected item order (reasoning must immediately precede function_call): %s", updated)
+	}
+
+	// Case 2: Turn 3+ input has an earlier assistant message AND a cached preamble message
+	replay.StoreFromCompleted(context.Background(), "grok-4.7", "session-fc-order", []byte(
+		`{"output":[{"type":"reasoning","encrypted_content":"`+enc+`"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"running command"}]},{"type":"function_call","call_id":"call_2","name":"shell","arguments":"{}"}]}`,
+	))
+	bodyWithPriorAssistant := []byte(`{"input":[{"type":"message","role":"user","content":"hi"},{"type":"message","role":"assistant","content":"hello from turn 1"},{"type":"message","role":"user","content":"run pwd"},{"type":"function_call","call_id":"call_2","name":"shell","arguments":"{}"},{"type":"function_call_output","call_id":"call_2","output":"/tmp"}]}`)
+	updated2 := replay.Apply(context.Background(), "grok-4.7", "session-fc-order", bodyWithPriorAssistant)
+	if err := json.Unmarshal(updated2, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Input) != 6 || parsed.Input[3]["type"] != "reasoning" || parsed.Input[4]["type"] != "function_call" {
+		t.Fatalf("expected reasoning injected at index 3 before function_call: %s", updated2)
+	}
+}
+
+func TestDiscardCaptureRetainsPreviousReplay(t *testing.T) {
+	store := memory.NewReasoningReplayStore(100)
+	replay := New(store, Config{Enabled: true, TTL: time.Hour}, slog.Default())
+	enc := validEncrypted(22)
+	replay.StoreFromCompleted(context.Background(), "grok-4.7", "session-discard", []byte(`{"output":[{"type":"reasoning","encrypted_content":"`+enc+`"}]}`))
+
+	degradedSSE := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"no thinking\"}]}]}}\n\n"
+	wrapped := replay.CaptureBody(io.NopCloser(strings.NewReader(degradedSSE)), "grok-4.7", "session-discard", true, false)
+	if _, err := io.ReadAll(wrapped); err != nil {
+		t.Fatal(err)
+	}
+	DiscardCapture(wrapped)
+	if err := wrapped.Close(); err != nil {
+		t.Fatal(err)
+	}
+	updated := replay.Apply(context.Background(), "grok-4.7", "session-discard", []byte(`{"input":[{"type":"message","role":"user","content":"next"}]}`))
+	if !strings.Contains(string(updated), enc) {
+		t.Fatalf("discarded capture wiped out previous turn replay: %s", updated)
+	}
+}

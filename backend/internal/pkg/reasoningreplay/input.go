@@ -22,9 +22,6 @@ func filterReplayItemsForInput(body []byte, items [][]byte) [][]byte {
 	lastAssistant, hasLastAssistant := lastAssistantMessage(inputItems)
 	cachedAssistant, hasCachedAssistant := replayAssistantMessage(items)
 	assistantMatches := hasLastAssistant && hasCachedAssistant && assistantContentEqual(lastAssistant, cachedAssistant)
-	if hasLastAssistant && hasCachedAssistant && !assistantMatches {
-		return nil
-	}
 	existingCalls := map[string]bool{}
 	existingOutputs := map[string]string{}
 	existingEncrypted := map[string]bool{}
@@ -53,6 +50,37 @@ func filterReplayItemsForInput(body []byte, items [][]byte) [][]byte {
 			}
 		}
 	}
+	hasMatchedToolCall := false
+	for _, item := range items {
+		var typed struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+		}
+		if json.Unmarshal(item, &typed) != nil {
+			continue
+		}
+		typeName := strings.TrimSpace(typed.Type)
+		if typeName != "function_call" && typeName != "custom_tool_call" {
+			continue
+		}
+		keys := replayToolCallKeys(typeName, typed.CallID)
+		if len(keys) > 0 && anyReplayCallKeyExists(existingCalls, keys) {
+			hasMatchedToolCall = true
+			break
+		}
+		for _, candidate := range comparableReplayCallIDs(typed.CallID) {
+			if existingOutputs[candidate] != "" {
+				hasMatchedToolCall = true
+				break
+			}
+		}
+		if hasMatchedToolCall {
+			break
+		}
+	}
+	if hasLastAssistant && hasCachedAssistant && !assistantMatches && !hasMatchedToolCall {
+		return nil
+	}
 	filtered := make([][]byte, 0, len(items))
 	for _, item := range items {
 		var typed struct {
@@ -69,7 +97,7 @@ func filterReplayItemsForInput(body []byte, items [][]byte) [][]byte {
 				continue
 			}
 		case "message":
-			if assistantMatches {
+			if assistantMatches || hasLastAssistant {
 				continue
 			}
 		case "function_call", "custom_tool_call":
@@ -241,7 +269,7 @@ func assistantParts(raw json.RawMessage) ([]assistantPart, bool) {
 	return result, len(result) > 0
 }
 
-func insertReplayItems(body []byte, replayItems [][]byte) ([]byte, bool) {
+func insertReplayItems(body []byte, replayItems [][]byte, allCachedItems ...[][]byte) ([]byte, bool) {
 	var payload map[string]json.RawMessage
 	if json.Unmarshal(body, &payload) != nil {
 		return body, false
@@ -254,7 +282,7 @@ func insertReplayItems(body []byte, replayItems [][]byte) ([]byte, bool) {
 	if json.Unmarshal(inputRaw, &input) != nil {
 		return body, false
 	}
-	insertAt := replayInsertIndex(input, replayItems)
+	insertAt := replayInsertIndex(input, replayItems, allCachedItems...)
 	// 不基于不可信请求长度计算预分配容量，交由 append 安全扩容。
 	next := make([]json.RawMessage, 0)
 	for i, item := range input {
@@ -282,9 +310,8 @@ func insertReplayItems(body []byte, replayItems [][]byte) ([]byte, bool) {
 	return updated, true
 }
 
-func replayInsertIndex(input []json.RawMessage, replayItems [][]byte) int {
-	replayCallIDs := map[string]bool{}
-	for _, item := range replayItems {
+func collectReplayCallIDs(items [][]byte, dst map[string]bool) {
+	for _, item := range items {
 		var typed struct {
 			Type   string `json:"type"`
 			CallID string `json:"call_id"`
@@ -294,9 +321,17 @@ func replayInsertIndex(input []json.RawMessage, replayItems [][]byte) int {
 		}
 		if typed.Type == "function_call" || typed.Type == "custom_tool_call" {
 			for _, id := range comparableReplayCallIDs(typed.CallID) {
-				replayCallIDs[id] = true
+				dst[id] = true
 			}
 		}
+	}
+}
+
+func replayInsertIndex(input []json.RawMessage, replayItems [][]byte, allCachedItems ...[][]byte) int {
+	replayCallIDs := map[string]bool{}
+	collectReplayCallIDs(replayItems, replayCallIDs)
+	for _, group := range allCachedItems {
+		collectReplayCallIDs(group, replayCallIDs)
 	}
 	if len(replayCallIDs) > 0 {
 		for index, raw := range input {
@@ -307,12 +342,18 @@ func replayInsertIndex(input []json.RawMessage, replayItems [][]byte) int {
 			if json.Unmarshal(raw, &typed) != nil {
 				continue
 			}
-			if typed.Type != "function_call_output" && typed.Type != "custom_tool_call_output" {
+			typeName := strings.TrimSpace(typed.Type)
+			isCall := typeName == "function_call" || typeName == "custom_tool_call"
+			isOutput := typeName == "function_call_output" || typeName == "custom_tool_call_output"
+			if !isCall && !isOutput {
 				continue
 			}
 			callIDs := comparableReplayCallIDs(typed.CallID)
 			if len(callIDs) == 0 {
-				return index
+				if isOutput {
+					return index
+				}
+				continue
 			}
 			for _, callID := range callIDs {
 				if replayCallIDs[callID] {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/pkg/neterror"
+	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
 )
 
 const (
@@ -43,7 +44,6 @@ func ConvertResponseStreamWithOptions(source io.ReadCloser, operation string, op
 	reader, writer := io.Pipe()
 	stream := newStreamPipeReadCloser(reader, source)
 	go func() {
-		defer stream.closeSource()
 		converter := newStreamConverter(writer, operation, options)
 		err := consumeSSE(source, converter.handle)
 		if err == nil && !converter.finished {
@@ -54,6 +54,9 @@ func ConvertResponseStreamWithOptions(source io.ReadCloser, operation string, op
 			// into a finished turn, and clients treat the terminator as proof
 			// that the answer is complete.
 			err = neterror.ErrUpstreamStreamIncomplete
+		}
+		if err != nil {
+			_ = stream.closeSource()
 		}
 		_ = writer.CloseWithError(err)
 	}()
@@ -121,6 +124,10 @@ type streamPipeReadCloser struct {
 
 func newStreamPipeReadCloser(reader *io.PipeReader, source io.ReadCloser) *streamPipeReadCloser {
 	return &streamPipeReadCloser{PipeReader: reader, source: source}
+}
+
+func (r *streamPipeReadCloser) DiscardReplayCapture() {
+	reasoningreplay.DiscardCapture(r.source)
 }
 
 func (r *streamPipeReadCloser) Close() error {
@@ -1112,7 +1119,6 @@ func guardResponseStream(source io.ReadCloser) io.ReadCloser {
 	reader, writer := io.Pipe()
 	stream := newStreamPipeReadCloser(reader, source)
 	go func() {
-		defer stream.closeSource()
 		tracker := streamRepeatTracker{}
 		err := consumeSSE(io.TeeReader(source, writer), func(event string, data []byte) error {
 			typeName, root, ok := parseSSEEvent(event, data)
@@ -1121,6 +1127,9 @@ func guardResponseStream(source io.ReadCloser) io.ReadCloser {
 			}
 			return tracker.trackEvent(typeName, root)
 		})
+		if err != nil {
+			_ = stream.closeSource()
+		}
 		_ = writer.CloseWithError(err)
 	}()
 	return stream

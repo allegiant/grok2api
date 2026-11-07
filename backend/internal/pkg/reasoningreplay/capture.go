@@ -7,8 +7,22 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+// CaptureDiscarder 允许调用方在丢弃失败/降级尝试的响应体前取消回放缓存写入，
+// 避免失败尝试覆盖或清空前序轮次有效的回放缓存。
+type CaptureDiscarder interface {
+	DiscardReplayCapture()
+}
+
+// DiscardCapture 若 body 实现了 CaptureDiscarder，则标记跳过回放缓存写入。
+func DiscardCapture(body any) {
+	if discarder, ok := body.(CaptureDiscarder); ok && discarder != nil {
+		discarder.DiscardReplayCapture()
+	}
+}
 
 func (r *ReasoningReplay) CaptureBody(body io.ReadCloser, model, sessionKey string, streaming, compact bool) io.ReadCloser {
 	if !r.Enabled() || body == nil || strings.TrimSpace(sessionKey) == "" || strings.TrimSpace(model) == "" {
@@ -35,7 +49,12 @@ type replayCaptureBody struct {
 	truncated bool
 	sawEOF    bool
 	readErr   error
-	done      bool
+	done      atomic.Bool
+	discarded atomic.Bool
+}
+
+func (b *replayCaptureBody) DiscardReplayCapture() {
+	b.discarded.Store(true)
 }
 
 func (b *replayCaptureBody) Read(p []byte) (int, error) {
@@ -57,12 +76,11 @@ func (b *replayCaptureBody) Read(p []byte) (int, error) {
 }
 
 func (b *replayCaptureBody) Close() error {
-	if b.done {
+	if !b.done.CompareAndSwap(false, true) {
 		return nil
 	}
-	b.done = true
 	closeErr := b.inner.Close()
-	if b.truncated || b.buf.Len() == 0 {
+	if b.discarded.Load() || b.truncated || b.buf.Len() == 0 {
 		return closeErr
 	}
 	payload := b.buf.Bytes()

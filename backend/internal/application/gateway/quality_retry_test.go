@@ -2088,4 +2088,21 @@ func TestObserveQualityChunkValidGrokEncryptedContentAndDoneSummaryDeliver(t *te
 	if got := ClassifyQualityHold(doneSig, 8); got != QualityDeliver {
 		t.Fatalf("output_item.done summary text got %s, want deliver (%#v)", got, doneSig)
 	}
+
+	// Short valid Grok Build encrypted_content (~107 base64 chars, 80 decoded high-entropy bytes) with 76 reasoning tokens.
+	shortValidCipher := testValidGrokEncryptedContent(9)[:108]
+	shortCipher := qualityScanState{protocol: qualityProtocolResponses}
+	ObserveQualityChunk(&shortCipher, []byte(sse(
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"`+shortValidCipher+`"}}`,
+		`data: {"type":"response.output_text.delta","delta":"`+strings.Repeat("word ", 20)+`"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","model":"grok-4.7","usage":{"output_tokens":98,"output_tokens_details":{"reasoning_tokens":76}}}}`,
+	)))
+	shortSig := shortCipher.signals()
+	if !shortSig.HasThinking || shortSig.ReasoningTokens != 76 {
+		t.Fatalf("short valid Grok Build encrypted_content with 76 reasoning tokens must count as thinking: %#v", shortSig)
+	}
+	if got := ClassifyQualityHold(shortSig, 8); got != QualityDeliver {
+		t.Fatalf("short valid Grok Build encrypted_content at terminal got %s, want deliver (%#v)", got, shortSig)
+	}
 }

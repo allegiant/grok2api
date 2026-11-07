@@ -86,7 +86,7 @@ func (r *ReasoningReplay) Apply(ctx context.Context, model, sessionKey string, b
 		r.logger.Debug("reasoning_replay_miss", "reason", "filtered", "model", model)
 		return body
 	}
-	updated, ok := insertReplayItems(body, filtered)
+	updated, ok := insertReplayItems(body, filtered, items)
 	if !ok {
 		r.logger.Debug("reasoning_replay_miss", "reason", "insert_failed", "model", model)
 		return body
