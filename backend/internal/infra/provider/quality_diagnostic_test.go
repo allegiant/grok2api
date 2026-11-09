@@ -92,6 +92,45 @@ func TestRawResponsesSummaryBoundsEventTypeLists(t *testing.T) {
 	}
 }
 
+func TestSummarizeRequestControlsAreSafeAndUseful(t *testing.T) {
+	body := `{"instructions":"PRIVATE_INSTRUCTIONS","reasoning":{"effort":"HIGH","summary":"DETAILED"},"output_config":{"effort":"MAX"},"thinking":{"type":"ADAPTIVE","budget_tokens":8192},"tool_choice":{"type":"function","name":"PRIVATE_TOOL_NAME"},"parallel_tool_calls":false,"max_output_tokens":4096,"previous_response_id":"PRIVATE_RESPONSE_ID","tools":[{"type":"function","name":"PRIVATE_TOOL_NAME"}],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"PRIVATE_PROMPT"}]}]}`
+	shape := SummarizeRequestShape([]byte(body), "responses")
+	if shape.PayloadBytes != len(body) || shape.ReasoningEffort != "high" || shape.OutputConfigEffort != "max" || shape.ReasoningSummary != "detailed" || shape.ThinkingType != "adaptive" {
+		t.Fatalf("request controls were not summarized: %#v", shape)
+	}
+	if shape.ThinkingBudgetTokens == nil || *shape.ThinkingBudgetTokens != 8192 || shape.ToolChoice != "function" || shape.ParallelToolCalls == nil || *shape.ParallelToolCalls {
+		t.Fatalf("thinking/tool controls were not summarized: %#v", shape)
+	}
+	if shape.OutputTokenLimit == nil || *shape.OutputTokenLimit != 4096 || shape.OutputTokenLimitSource != "max_output_tokens" || !shape.PreviousResponseIDSeen {
+		t.Fatalf("token/replay controls were not summarized: %#v", shape)
+	}
+	encoded, err := json.Marshal(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"PRIVATE_INSTRUCTIONS", "PRIVATE_TOOL_NAME", "PRIVATE_RESPONSE_ID", "PRIVATE_PROMPT"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("request controls leaked %q: %s", secret, encoded)
+		}
+	}
+}
+
+func TestSummarizeRequestControlsCollapseUnknownLabels(t *testing.T) {
+	shape := SummarizeRequestShape([]byte(`{"reasoning":{"effort":"PRIVATE_EFFORT","summary":"PRIVATE_SUMMARY"},"tool_choice":{"type":"PRIVATE_CHOICE","name":"PRIVATE_TOOL_NAME"}}`), "responses")
+	if shape.ReasoningEffort != "other" || shape.ReasoningSummary != "other" || shape.ToolChoice != "other" {
+		t.Fatalf("unknown control labels were not collapsed: %#v", shape)
+	}
+	encoded, err := json.Marshal(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"PRIVATE_EFFORT", "PRIVATE_SUMMARY", "PRIVATE_CHOICE", "PRIVATE_TOOL_NAME"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("unknown request control leaked %q: %s", secret, encoded)
+		}
+	}
+}
+
 func mustJSON(t *testing.T, value any) string {
 	t.Helper()
 	encoded, err := json.Marshal(value)

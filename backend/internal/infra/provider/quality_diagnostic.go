@@ -17,12 +17,23 @@ const (
 // RequestShapeSummary contains only protocol labels, bounded counts, and
 // encrypted payload lengths. It must never contain values from request content.
 type RequestShapeSummary struct {
-	Protocol        string             `json:"protocol"`
-	PayloadFormat   string             `json:"payload_format"`
-	Items           []RequestShapeItem `json:"items,omitempty"`
-	ToolDefinitions int                `json:"tool_definitions,omitempty"`
-	Truncated       bool               `json:"truncated,omitempty"`
-	InvalidJSON     bool               `json:"invalid_json,omitempty"`
+	Protocol               string             `json:"protocol"`
+	PayloadFormat          string             `json:"payload_format"`
+	PayloadBytes           int                `json:"payload_bytes,omitempty"`
+	Items                  []RequestShapeItem `json:"items,omitempty"`
+	ToolDefinitions        int                `json:"tool_definitions,omitempty"`
+	ReasoningEffort        string             `json:"reasoning_effort,omitempty"`
+	OutputConfigEffort     string             `json:"output_config_effort,omitempty"`
+	ReasoningSummary       string             `json:"reasoning_summary,omitempty"`
+	ThinkingType           string             `json:"thinking_type,omitempty"`
+	ThinkingBudgetTokens   *int64             `json:"thinking_budget_tokens,omitempty"`
+	ToolChoice             string             `json:"tool_choice,omitempty"`
+	ParallelToolCalls      *bool              `json:"parallel_tool_calls,omitempty"`
+	OutputTokenLimit       *int64             `json:"output_token_limit,omitempty"`
+	OutputTokenLimitSource string             `json:"output_token_limit_source,omitempty"`
+	PreviousResponseIDSeen bool               `json:"previous_response_id_seen"`
+	Truncated              bool               `json:"truncated,omitempty"`
+	InvalidJSON            bool               `json:"invalid_json,omitempty"`
 }
 
 // RequestShapeItem describes one message or Responses input item without
@@ -42,7 +53,7 @@ type RequestShapeItem struct {
 // Messages, Chat Completions, or Responses request JSON. Unknown labels are
 // collapsed to "other" so clients cannot smuggle arbitrary strings into logs.
 func SummarizeRequestShape(body []byte, operation string) RequestShapeSummary {
-	shape := RequestShapeSummary{Protocol: requestShapeProtocol(operation), PayloadFormat: "unknown"}
+	shape := RequestShapeSummary{Protocol: requestShapeProtocol(operation), PayloadFormat: "unknown", PayloadBytes: len(body)}
 	if len(body) == 0 {
 		return shape
 	}
@@ -56,6 +67,7 @@ func SummarizeRequestShape(body []byte, operation string) RequestShapeSummary {
 		shape.InvalidJSON = true
 		return shape
 	}
+	summarizeRequestControls(&shape, root)
 	if tools := rawArrayLength(root["tools"]); tools > 0 {
 		shape.ToolDefinitions = tools
 	}
@@ -105,6 +117,80 @@ func requestShapeProtocol(operation string) string {
 	default:
 		return "other"
 	}
+}
+
+func summarizeRequestControls(shape *RequestShapeSummary, root map[string]json.RawMessage) {
+	if shape == nil {
+		return
+	}
+	var reasoning, outputConfig, thinking map[string]json.RawMessage
+	_ = json.Unmarshal(root["reasoning"], &reasoning)
+	_ = json.Unmarshal(root["output_config"], &outputConfig)
+	_ = json.Unmarshal(root["thinking"], &thinking)
+
+	shape.ReasoningEffort = safeRequestOption(rawString(reasoning["effort"]), "none", "minimal", "low", "medium", "high", "xhigh", "max")
+	if shape.ReasoningEffort == "" {
+		shape.ReasoningEffort = safeRequestOption(rawString(root["reasoning_effort"]), "none", "minimal", "low", "medium", "high", "xhigh", "max")
+	}
+	shape.OutputConfigEffort = safeRequestOption(rawString(outputConfig["effort"]), "none", "minimal", "low", "medium", "high", "xhigh", "max")
+	shape.ReasoningSummary = safeRequestOption(rawString(reasoning["summary"]), "auto", "concise", "detailed")
+	shape.ThinkingType = safeRequestOption(rawString(thinking["type"]), "enabled", "adaptive", "disabled")
+	if shape.ThinkingType == "" {
+		shape.ThinkingType = safeRequestOption(rawString(root["thinking"]), "enabled", "adaptive", "disabled")
+	}
+	if budget, ok := rawInt64(thinking["budget_tokens"]); ok {
+		shape.ThinkingBudgetTokens = &budget
+	}
+	shape.ToolChoice = safeRequestToolChoice(root["tool_choice"])
+	if raw, ok := root["parallel_tool_calls"]; ok {
+		var parallel bool
+		if json.Unmarshal(raw, &parallel) == nil {
+			shape.ParallelToolCalls = &parallel
+		}
+	}
+	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
+		if value, ok := rawInt64(root[key]); ok {
+			shape.OutputTokenLimit = &value
+			shape.OutputTokenLimitSource = key
+			break
+		}
+	}
+	_, shape.PreviousResponseIDSeen = root["previous_response_id"]
+}
+
+func safeRequestOption(value string, allowed ...string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	for _, candidate := range allowed {
+		if value == candidate {
+			return value
+		}
+	}
+	return "other"
+}
+
+func safeRequestToolChoice(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if value := rawString(raw); value != "" {
+		return safeRequestOption(value, "auto", "none", "required", "any")
+	}
+	var choice map[string]json.RawMessage
+	if json.Unmarshal(raw, &choice) != nil || choice == nil {
+		return "other"
+	}
+	return safeRequestOption(rawString(choice["type"]), "auto", "none", "required", "any", "function", "tool", "custom")
+}
+
+func rawInt64(raw json.RawMessage) (int64, bool) {
+	var value int64
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return 0, false
+	}
+	return value, true
 }
 
 func (s *RequestShapeSummary) appendRawItems(rawItems []json.RawMessage) {
