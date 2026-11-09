@@ -421,6 +421,10 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			}
 		}
 	}
+	if request.QualityDiagnostic != nil && request.Streaming && isHTTPSuccess(resp.StatusCode) &&
+		(request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages) {
+		resp.Body = request.QualityDiagnostic.ObserveUpstreamResponses(resp.Body)
+	}
 	if request.Streaming && isHTTPSuccess(resp.StatusCode) && resp.Body != nil {
 		resp.Body = wrapBuildSemanticIdle(resp.Body, a.config().StreamIdleTimeout)
 	}
@@ -592,7 +596,7 @@ type responseCall struct {
 // doResponseRequest 发起一次真实 Responses 上游调用，并保留该次调用自己的审计来源信息。
 func (a *Adapter) doResponseRequest(ctx context.Context, request provider.ResponseResourceRequest, accessToken string, body []byte, base string) (call responseCall) {
 	if request.QualityDiagnostic != nil {
-		request.QualityDiagnostic.UpstreamRequest = provider.SummarizeRequestShape(body, request.Operation)
+		request.QualityDiagnostic.SetUpstreamRequest(provider.SummarizeRequestShape(body, request.Operation))
 	}
 	startedAt := time.Now()
 	call = responseCall{upstreamURL: a.urlWithBase(base, request.Path), startedAt: startedAt.UTC()}

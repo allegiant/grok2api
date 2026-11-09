@@ -2,6 +2,7 @@ package provider
 
 import (
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 )
@@ -28,6 +29,76 @@ func TestSummarizeRequestShapeRedactsContentAndBoundsLabels(t *testing.T) {
 	if shape.Items[2].ToolCalls != 1 || shape.Items[3].ToolResults != 1 {
 		t.Fatalf("tool structure was not retained: %#v", shape.Items)
 	}
+}
+
+func TestObserveUpstreamResponsesPreservesBytesAndRedactsSummary(t *testing.T) {
+	ciphertext := "PRIVATE_RAW_CIPHERTEXT"
+	prompt := "PRIVATE_RAW_REASONING"
+	argument := `{"token":"PRIVATE_TOOL_ARGUMENT"}`
+	frames := []string{
+		`event: response.output_item.added` + "\n" + `data: {"type":"response.output_item.added","item":{"id":"PRIVATE_ID","type":"reasoning"}}`,
+		`event: response.reasoning_summary_text.delta` + "\n" + `data: {"type":"response.reasoning_summary_text.delta","delta":"` + prompt + `"}`,
+		`event: response.output_item.done` + "\n" + `data: {"type":"response.output_item.done","item":{"id":"PRIVATE_ID","type":"reasoning","encrypted_content":"` + ciphertext + `","summary":[{"type":"summary_text","text":"PRIVATE_SUMMARY"}]}}`,
+		`event: response.output_item.added` + "\n" + `data: {"type":"response.output_item.added","item":{"id":"PRIVATE_CALL_ID","type":"function_call"}}`,
+		`event: response.function_call_arguments.delta` + "\n" + `data: {"type":"response.function_call_arguments.delta","delta":` + mustJSON(t, argument) + `}`,
+		`event: response.in_progress` + "\n" + `data: {"type":"response.in_progress","usage":{"output_tokens":20,"output_tokens_details":{"reasoning_tokens":8}}}`,
+		`event: response.completed` + "\n" + `data: {"type":"response.completed","response":{"usage":{"output_tokens":34,"output_tokens_details":{"reasoning_tokens":0}},"output":[{"type":"function_call_output","output":"PRIVATE_TOOL_OUTPUT"}]}}`,
+	}
+	fixture := strings.Join(frames, "\n\n") + "\n\n"
+	diagnostic := &QualityRequestDiagnostic{}
+	body := diagnostic.ObserveUpstreamResponses(io.NopCloser(strings.NewReader(fixture)))
+	gotBytes, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if string(gotBytes) != fixture {
+		t.Fatal("raw response observer changed upstream SSE bytes")
+	}
+	_, _, summary := diagnostic.Snapshot()
+	if summary.ReasoningItemEvents == 0 || summary.ReasoningTextEvents != 1 || summary.ReasoningTextParts != 1 || summary.ReasoningPayloadBytes != len(ciphertext) {
+		t.Fatalf("raw reasoning summary = %#v", summary)
+	}
+	if summary.FunctionCallItemEvents == 0 || summary.FunctionCallArgumentEvents != 1 || summary.FunctionCallOutputEvents == 0 {
+		t.Fatalf("raw tool summary = %#v", summary)
+	}
+	if !summary.UsageReported || summary.OutputTokens != 34 || summary.ReasoningTokens != 0 || !summary.Terminal {
+		t.Fatalf("raw usage/terminal summary = %#v", summary)
+	}
+	encoded, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{ciphertext, prompt, argument, "PRIVATE_SUMMARY", "PRIVATE_TOOL_OUTPUT", "PRIVATE_ID", "PRIVATE_CALL_ID"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("raw response summary leaked %q: %s", secret, encoded)
+		}
+	}
+}
+
+func TestRawResponsesSummaryBoundsEventTypeLists(t *testing.T) {
+	fixture := strings.Repeat("data: {\"type\":\"response.created\"}\n\n", maxRawResponsesTypes+5)
+	diagnostic := &QualityRequestDiagnostic{}
+	body := diagnostic.ObserveUpstreamResponses(io.NopCloser(strings.NewReader(fixture)))
+	if _, err := io.Copy(io.Discard, body); err != nil {
+		t.Fatal(err)
+	}
+	_ = body.Close()
+	_, _, summary := diagnostic.Snapshot()
+	if len(summary.Events) != maxRawResponsesTypes || !summary.EventsTruncated || summary.EventCount != maxRawResponsesTypes+5 {
+		t.Fatalf("raw event type list was not bounded: %#v", summary)
+	}
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }
 
 func TestSummarizeResponsesRequestShapeAndInputLimit(t *testing.T) {

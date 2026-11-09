@@ -376,6 +376,65 @@ func TestForwardResponseMatchesGrokBuildHeadersAndPreservesReasoning(t *testing.
 	}
 }
 
+func TestForwardMessagesCapturesRawUpstreamResponsesBeforeConversion(t *testing.T) {
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"PRIVATE_RESPONSE_ID","model":"grok-4.6"}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"PRIVATE_REASONING_ID","type":"reasoning"}}`,
+		`data: {"type":"response.reasoning_summary_text.delta","item_id":"PRIVATE_REASONING_ID","delta":"PRIVATE_REASONING_TEXT"}`,
+		`data: {"type":"response.output_item.done","item":{"id":"PRIVATE_REASONING_ID","type":"reasoning","encrypted_content":"PRIVATE_CIPHERTEXT","summary":[{"type":"summary_text","text":"PRIVATE_SUMMARY"}]}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"PRIVATE_CALL_ID","type":"function_call","call_id":"PRIVATE_CALL","name":"PRIVATE_TOOL"}}`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"PRIVATE_CALL_ID","delta":"PRIVATE_ARGUMENT"}`,
+		`data: {"type":"response.completed","response":{"id":"PRIVATE_RESPONSE_ID","status":"completed","usage":{"output_tokens":18,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+	}, "\n\n") + "\n\n"
+	adapter := NewAdapter(Config{BaseURL: "https://cli-chat-proxy.grok.com/v1"}, cipher)
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(fixture)),
+			Request:    request,
+		}, nil
+	})
+	diagnostic := &provider.QualityRequestDiagnostic{}
+	response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: account.Credential{ID: 1, EncryptedAccessToken: encrypted},
+		Method:     http.MethodPost, Path: "/responses", Model: "grok-4.6", Operation: conversation.OperationMessages,
+		Body: []byte(`{}`), Streaming: true, QualityDiagnostic: diagnostic,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	_, _, raw := diagnostic.Snapshot()
+	if raw.ReasoningTextEvents != 1 || raw.ReasoningItemEvents == 0 || raw.ReasoningPayloadBytes != len("PRIVATE_CIPHERTEXT") {
+		t.Fatalf("raw upstream reasoning summary = %#v", raw)
+	}
+	if raw.FunctionCallItemEvents == 0 || raw.FunctionCallArgumentEvents != 1 || raw.OutputTokens != 18 || raw.ReasoningTokens != 0 || !raw.Terminal {
+		t.Fatalf("raw upstream response summary = %#v", raw)
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"PRIVATE_RESPONSE_ID", "PRIVATE_REASONING_ID", "PRIVATE_REASONING_TEXT", "PRIVATE_CIPHERTEXT", "PRIVATE_SUMMARY", "PRIVATE_TOOL", "PRIVATE_ARGUMENT"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("raw upstream summary leaked %q: %s", secret, encoded)
+		}
+	}
+}
+
 func TestNormalizeGrokTurnIndex(t *testing.T) {
 	tests := []struct {
 		name  string

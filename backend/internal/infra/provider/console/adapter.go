@@ -169,7 +169,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		}
 	}
 	if request.QualityDiagnostic != nil {
-		request.QualityDiagnostic.UpstreamRequest = provider.SummarizeRequestShape(body, request.Operation)
+		request.QualityDiagnostic.SetUpstreamRequest(provider.SummarizeRequestShape(body, request.Operation))
 	}
 	cfg := a.config()
 	requestCtx, totalCancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
@@ -194,6 +194,10 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		lease.Release()
 		cancel()
 		return nil, err
+	}
+	if request.QualityDiagnostic != nil && request.Streaming && response.StatusCode >= 200 && response.StatusCode < 300 &&
+		(request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages) {
+		response.Body = request.QualityDiagnostic.ObserveUpstreamResponses(response.Body)
 	}
 	if idleCancel != nil && response.StatusCode >= 200 && response.StatusCode < 300 && response.Body != nil {
 		response.Body = providerstreamidle.New(response.Body, time.Duration(cfg.StreamIdleTimeoutSeconds)*time.Second, idleCancel)

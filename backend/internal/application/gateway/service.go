@@ -1048,9 +1048,8 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	normalizedMetadata := &provider.NormalizedRequestMetadata{}
 	var qualityDiagnostic *provider.QualityRequestDiagnostic
 	if qualityHoldEnabled {
-		qualityDiagnostic = &provider.QualityRequestDiagnostic{
-			IncomingRequest: provider.SummarizeRequestShape(input.Body, string(operation)),
-		}
+		qualityDiagnostic = &provider.QualityRequestDiagnostic{}
+		qualityDiagnostic.SetIncomingRequest(provider.SummarizeRequestShape(input.Body, string(operation)))
 	}
 	responseStartedAt := startedAt
 	transientRetry := 0
@@ -1655,9 +1654,9 @@ attemptLoop:
 				if verdict == QualityWithhold {
 					incomingShape := provider.RequestShapeSummary{}
 					upstreamShape := provider.RequestShapeSummary{}
+					rawUpstreamResponse := provider.RawResponsesStreamSummary{}
 					if qualityDiagnostic != nil {
-						incomingShape = qualityDiagnostic.IncomingRequest
-						upstreamShape = qualityDiagnostic.UpstreamRequest
+						incomingShape, upstreamShape, rawUpstreamResponse = qualityDiagnostic.Snapshot()
 					}
 					s.logger.Info("quality_degraded_diagnostic",
 						"request_id", input.RequestID,
@@ -1667,6 +1666,7 @@ attemptLoop:
 						"incoming_request_shape", marshalQualityDiagnosticJSON(incomingShape),
 						"upstream_request_shape", marshalQualityDiagnosticJSON(upstreamShape),
 						"response_stream_shape", marshalQualityDiagnosticJSON(peekMetadata.Stream),
+						"raw_upstream_response_shape", marshalQualityDiagnosticJSON(rawUpstreamResponse),
 						"output_tokens", peekUsage.OutputTokens,
 						"reasoning_tokens", peekUsage.ReasoningTokens,
 					)

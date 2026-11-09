@@ -1,7 +1,9 @@
 package provider
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"strings"
 )
 
@@ -303,4 +305,333 @@ func rawArrayLength(raw json.RawMessage) int {
 		return 0
 	}
 	return min(len(values), maxRequestShapeToolCount)
+}
+
+const (
+	maxRawResponsesEventBytes = 256 << 10
+	maxRawResponsesTypes      = 32
+)
+
+// RawResponsesStreamSummary describes raw upstream events before conversion to
+// Chat or Anthropic. It contains only whitelisted types, counts, and token usage.
+type RawResponsesStreamSummary struct {
+	Events                     []string `json:"events,omitempty"`
+	EventCount                 int      `json:"event_count,omitempty"`
+	EventsTruncated            bool     `json:"events_truncated,omitempty"`
+	OutputItemTypes            []string `json:"output_item_types,omitempty"`
+	OutputItemsTruncated       bool     `json:"output_items_truncated,omitempty"`
+	ReasoningItemEvents        int      `json:"reasoning_item_events,omitempty"`
+	ReasoningTextEvents        int      `json:"reasoning_text_events,omitempty"`
+	ReasoningTextParts         int      `json:"reasoning_text_parts,omitempty"`
+	FunctionCallItemEvents     int      `json:"function_call_item_events,omitempty"`
+	FunctionCallOutputEvents   int      `json:"function_call_output_events,omitempty"`
+	FunctionCallArgumentEvents int      `json:"function_call_argument_events,omitempty"`
+	OutputTextEvents           int      `json:"output_text_events,omitempty"`
+	ReasoningPayloadBytes      int      `json:"reasoning_payload_bytes,omitempty"`
+	UsageReported              bool     `json:"usage_reported"`
+	OutputTokens               int64    `json:"output_tokens,omitempty"`
+	ReasoningTokens            int64    `json:"reasoning_tokens,omitempty"`
+	Terminal                   bool     `json:"terminal"`
+	Truncated                  bool     `json:"truncated"`
+	MalformedEvents            int      `json:"malformed_events,omitempty"`
+}
+
+type rawResponsesEventBuffer struct {
+	line            []byte
+	event           string
+	data            []byte
+	discardingLine  bool
+	discardingFrame bool
+}
+
+// ObserveUpstreamResponses wraps a raw Responses SSE body with a content-free
+// observer. Bytes are passed through unchanged to the protocol converter.
+func (d *QualityRequestDiagnostic) ObserveUpstreamResponses(body io.ReadCloser) io.ReadCloser {
+	if d == nil || body == nil {
+		return body
+	}
+	return &qualityDiagnosticResponsesBody{ReadCloser: body, diagnostic: d}
+}
+
+type qualityDiagnosticResponsesBody struct {
+	io.ReadCloser
+	diagnostic *QualityRequestDiagnostic
+}
+
+func (b *qualityDiagnosticResponsesBody) Read(dst []byte) (int, error) {
+	n, err := b.ReadCloser.Read(dst)
+	if n > 0 || err == io.EOF {
+		b.diagnostic.observeRawResponsesChunk(dst[:n], err == io.EOF)
+	}
+	return n, err
+}
+
+func (d *QualityRequestDiagnostic) observeRawResponsesChunk(chunk []byte, eof bool) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	buffer := &d.rawEventBuffer
+	for _, value := range chunk {
+		if buffer.discardingLine {
+			if value == '\n' {
+				buffer.discardingLine = false
+			}
+			continue
+		}
+		if value == '\n' {
+			line := bytes.TrimSuffix(buffer.line, []byte{'\r'})
+			d.processRawResponsesLine(line)
+			buffer.line = buffer.line[:0]
+			continue
+		}
+		if len(buffer.line) >= maxRawResponsesEventBytes {
+			buffer.line = buffer.line[:0]
+			buffer.discardingLine = true
+			buffer.discardingFrame = true
+			d.rawResponse.Truncated = true
+			continue
+		}
+		buffer.line = append(buffer.line, value)
+	}
+	if eof {
+		if buffer.discardingLine {
+			buffer.discardingLine = false
+			buffer.discardingFrame = true
+		} else if len(buffer.line) > 0 {
+			d.processRawResponsesLine(bytes.TrimSuffix(buffer.line, []byte{'\r'}))
+			buffer.line = buffer.line[:0]
+		}
+		d.finishRawResponsesFrame()
+	}
+}
+
+func (d *QualityRequestDiagnostic) processRawResponsesLine(line []byte) {
+	buffer := &d.rawEventBuffer
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		d.finishRawResponsesFrame()
+		return
+	}
+	if buffer.discardingFrame {
+		return
+	}
+	if bytes.HasPrefix(trimmed, []byte("event:")) {
+		buffer.event = safeRawResponsesEventType(strings.TrimSpace(string(bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("event:"))))))
+		return
+	}
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return
+	}
+	payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
+	separator := 0
+	if len(buffer.data) > 0 {
+		separator = 1
+	}
+	if len(buffer.data)+separator+len(payload) > maxRawResponsesEventBytes {
+		buffer.data = buffer.data[:0]
+		buffer.discardingFrame = true
+		d.rawResponse.Truncated = true
+		return
+	}
+	if separator > 0 {
+		buffer.data = append(buffer.data, '\n')
+	}
+	buffer.data = append(buffer.data, payload...)
+}
+
+func (d *QualityRequestDiagnostic) finishRawResponsesFrame() {
+	buffer := &d.rawEventBuffer
+	if !buffer.discardingFrame && len(buffer.data) > 0 {
+		d.observeRawResponsesPayload(buffer.event, buffer.data)
+	}
+	buffer.event = ""
+	buffer.data = buffer.data[:0]
+	buffer.discardingFrame = false
+}
+
+func (d *QualityRequestDiagnostic) observeRawResponsesPayload(eventName string, payload []byte) {
+	if bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")) {
+		d.rawResponse.EventCount++
+		d.rawResponse.Terminal = true
+		appendRawDiagnosticType(&d.rawResponse.Events, &d.rawResponse.EventsTruncated, "done")
+		return
+	}
+	var root map[string]json.RawMessage
+	if json.Unmarshal(payload, &root) != nil || root == nil {
+		d.rawResponse.MalformedEvents++
+		return
+	}
+	eventType := rawString(root["type"])
+	if eventType == "" {
+		eventType = eventName
+	}
+	if eventType == "" {
+		d.rawResponse.MalformedEvents++
+		return
+	}
+	eventType = safeRawResponsesEventType(eventType)
+	d.rawResponse.EventCount++
+	appendRawDiagnosticType(&d.rawResponse.Events, &d.rawResponse.EventsTruncated, eventType)
+	switch eventType {
+	case "response.completed", "response.incomplete", "response.failed", "error":
+		d.rawResponse.Terminal = true
+	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+		if rawString(root["delta"]) != "" {
+			d.rawResponse.ReasoningTextEvents++
+		}
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		d.rawResponse.ReasoningTextParts += countRawReasoningTextParts(root["part"])
+	case "response.output_text.delta":
+		if rawString(root["delta"]) != "" {
+			d.rawResponse.OutputTextEvents++
+		}
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.mcp_call_arguments.delta":
+		d.rawResponse.FunctionCallArgumentEvents++
+	case "response.output_item.added", "response.output_item.done":
+		d.observeRawResponsesItem(root["item"])
+	}
+	if usage, ok := root["usage"]; ok {
+		d.observeRawResponsesUsage(usage)
+	}
+	if responseRaw, ok := root["response"]; ok {
+		var response struct {
+			Output []json.RawMessage `json:"output"`
+			Usage  json.RawMessage   `json:"usage"`
+		}
+		if json.Unmarshal(responseRaw, &response) == nil {
+			if len(response.Usage) > 0 {
+				d.observeRawResponsesUsage(response.Usage)
+			}
+			for _, item := range response.Output {
+				d.observeRawResponsesItem(item)
+			}
+		}
+	}
+}
+
+func (d *QualityRequestDiagnostic) observeRawResponsesItem(raw json.RawMessage) {
+	var item struct {
+		Type             string          `json:"type"`
+		EncryptedContent string          `json:"encrypted_content"`
+		Content          json.RawMessage `json:"content"`
+		Summary          json.RawMessage `json:"summary"`
+	}
+	if json.Unmarshal(raw, &item) != nil {
+		d.rawResponse.MalformedEvents++
+		return
+	}
+	itemType := safeRawResponsesItemType(item.Type)
+	appendRawDiagnosticType(&d.rawResponse.OutputItemTypes, &d.rawResponse.OutputItemsTruncated, itemType)
+	switch itemType {
+	case "reasoning":
+		d.rawResponse.ReasoningItemEvents++
+		d.rawResponse.ReasoningPayloadBytes = max(d.rawResponse.ReasoningPayloadBytes, len(item.EncryptedContent))
+		d.rawResponse.ReasoningTextParts += countRawReasoningTextParts(item.Content)
+		d.rawResponse.ReasoningTextParts += countRawReasoningTextParts(item.Summary)
+	case "function_call", "custom_tool_call", "computer_call", "shell_call", "local_shell_call", "mcp_call":
+		d.rawResponse.FunctionCallItemEvents++
+	case "function_call_output", "custom_tool_call_output", "computer_call_output", "shell_call_output", "mcp_call_output":
+		d.rawResponse.FunctionCallOutputEvents++
+	}
+}
+
+func countRawReasoningTextParts(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) == nil {
+		count := 0
+		for _, part := range parts {
+			if (part.Type == "reasoning_text" || part.Type == "summary_text") && part.Text != "" {
+				count++
+			}
+		}
+		return count
+	}
+	var part struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &part) == nil && (part.Type == "reasoning_text" || part.Type == "summary_text") && part.Text != "" {
+		return 1
+	}
+	return 0
+}
+
+func (d *QualityRequestDiagnostic) observeRawResponsesUsage(raw json.RawMessage) {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return
+	}
+	var usage struct {
+		OutputTokens        int64 `json:"output_tokens"`
+		CompletionTokens    int64 `json:"completion_tokens"`
+		ReasoningTokens     int64 `json:"reasoning_tokens"`
+		OutputTokensDetails struct {
+			ReasoningTokens int64 `json:"reasoning_tokens"`
+		} `json:"output_tokens_details"`
+		CompletionTokenDetails struct {
+			ReasoningTokens int64 `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
+	}
+	if json.Unmarshal(raw, &usage) != nil {
+		d.rawResponse.MalformedEvents++
+		return
+	}
+	d.rawResponse.UsageReported = true
+	outputTokens := usage.OutputTokens
+	if outputTokens == 0 {
+		outputTokens = usage.CompletionTokens
+	}
+	reasoningTokens := usage.OutputTokensDetails.ReasoningTokens
+	if reasoningTokens == 0 {
+		reasoningTokens = usage.CompletionTokenDetails.ReasoningTokens
+	}
+	if reasoningTokens == 0 {
+		reasoningTokens = usage.ReasoningTokens
+	}
+	d.rawResponse.OutputTokens = outputTokens
+	d.rawResponse.ReasoningTokens = reasoningTokens
+}
+
+func appendRawDiagnosticType(values *[]string, truncated *bool, value string) {
+	if values == nil || truncated == nil {
+		return
+	}
+	if len(*values) >= maxRawResponsesTypes {
+		*truncated = true
+		return
+	}
+	*values = append(*values, value)
+}
+
+func safeRawResponsesEventType(value string) string {
+	switch value {
+	case "response.created", "response.in_progress", "response.output_item.added", "response.output_item.done", "response.content_part.added", "response.content_part.done", "response.output_text.delta", "response.output_text.done", "response.reasoning_text.delta", "response.reasoning_text.done", "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done", "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done", "response.mcp_call_arguments.delta", "response.mcp_call_arguments.done", "response.completed", "response.incomplete", "response.failed", "error":
+		return value
+	default:
+		return "other"
+	}
+}
+
+func safeRawResponsesItemType(value string) string {
+	switch value {
+	case "message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "computer_call", "computer_call_output", "shell_call", "shell_call_output", "local_shell_call", "mcp_call", "mcp_call_output", "web_search_call", "web_search_call_output", "image_generation_call", "code_interpreter_call":
+		return value
+	default:
+		return "other"
+	}
+}
+
+func cloneRequestShape(shape RequestShapeSummary) RequestShapeSummary {
+	shape.Items = append([]RequestShapeItem(nil), shape.Items...)
+	for i := range shape.Items {
+		shape.Items[i].ContentTypes = append([]string(nil), shape.Items[i].ContentTypes...)
+	}
+	return shape
 }

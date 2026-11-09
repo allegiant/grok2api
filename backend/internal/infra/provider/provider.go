@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -382,11 +383,49 @@ type ResponseResourceRequest struct {
 	QualityDiagnostic *QualityRequestDiagnostic
 }
 
-// QualityRequestDiagnostic holds structural summaries for a single gateway
-// request. Adapters update UpstreamRequest only after final normalization.
+// QualityRequestDiagnostic holds structural summaries for one quality-guarded
+// request. Raw response events are observed concurrently by the stream adapter.
 type QualityRequestDiagnostic struct {
-	IncomingRequest RequestShapeSummary
-	UpstreamRequest RequestShapeSummary
+	mu              sync.Mutex
+	incomingRequest RequestShapeSummary
+	upstreamRequest RequestShapeSummary
+	rawResponse     RawResponsesStreamSummary
+	rawEventBuffer  rawResponsesEventBuffer
+}
+
+// SetIncomingRequest records the client request shape before provider conversion.
+func (d *QualityRequestDiagnostic) SetIncomingRequest(shape RequestShapeSummary) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.incomingRequest = shape
+	d.mu.Unlock()
+}
+
+// SetUpstreamRequest records the exact normalized payload used by an adapter.
+func (d *QualityRequestDiagnostic) SetUpstreamRequest(shape RequestShapeSummary) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.upstreamRequest = shape
+	d.mu.Unlock()
+}
+
+// Snapshot returns an immutable, content-free copy safe for structured logging.
+func (d *QualityRequestDiagnostic) Snapshot() (RequestShapeSummary, RequestShapeSummary, RawResponsesStreamSummary) {
+	if d == nil {
+		return RequestShapeSummary{}, RequestShapeSummary{}, RawResponsesStreamSummary{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	incoming := cloneRequestShape(d.incomingRequest)
+	upstream := cloneRequestShape(d.upstreamRequest)
+	raw := d.rawResponse
+	raw.Events = append([]string(nil), raw.Events...)
+	raw.OutputItemTypes = append([]string(nil), raw.OutputItemTypes...)
+	return incoming, upstream, raw
 }
 
 // NormalizedRequestMetadata contains safe request attributes that may be kept
