@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -131,13 +132,20 @@ func normalizeBuildRequestPayloadWithMetadata(payload map[string]json.RawMessage
 }
 
 func shouldDefaultBuildReasoningSummary(payload map[string]json.RawMessage, model, operation string) bool {
-	if operation != conversation.OperationChat || modeldomain.IsGrokComposerModel(model) {
+	if modeldomain.IsGrokComposerModel(model) {
 		return false
 	}
 	if effort, ok := buildReasoningEffort(payload); ok && strings.EqualFold(strings.TrimSpace(effort), modeldomain.ReasoningEffortNone) {
 		return false
 	}
-	return true
+	switch operation {
+	case conversation.OperationChat:
+		return true
+	case "", conversation.OperationResponses:
+		return hasRecognizedBuildReasoningEffort(payload) || modeldomain.SupportsReasoningForProvider(accountdomain.ProviderBuild, model)
+	default:
+		return false
+	}
 }
 
 func hasRecognizedBuildReasoningEffort(payload map[string]json.RawMessage) bool {
