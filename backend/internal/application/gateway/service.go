@@ -1217,23 +1217,6 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		_ = fallback.response.Body.Close()
 		fallback = nil
 	}
-	isMultiTurnContinuation := qualityHoldEnabled && qualityRequestIsMultiTurnContinuation(input.Body)
-	type deferredMissingThinking struct {
-		credential        accountdomain.Credential
-		usage             Usage
-		upstreamStartedAt time.Time
-	}
-	var deferredPenalty *deferredMissingThinking
-	flushDeferredPenalty := func() {
-		if deferredPenalty == nil {
-			return
-		}
-		s.applyMissingThinkingPenalty(ctx, input.RequestID, deferredPenalty.credential, holdCfg.AccountCooldown, holdCfg.AutoDisable)
-		s.recordQualityDegraded(ctx, auditBase, deferredPenalty.credential, deferredPenalty.usage, deferredPenalty.upstreamStartedAt, egressTrace, route.Provider)
-		failureAttempts.captureQualityDegraded(deferredPenalty.credential, deferredPenalty.upstreamStartedAt)
-		deferredPenalty = nil
-	}
-	multiTurnSemanticWithholds := 0
 attemptLoop:
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 		if qualityHoldEnabled && qualityAccountAttempts >= holdCfg.MaxAttempts {
@@ -1663,37 +1646,15 @@ attemptLoop:
 					hasNextAccount = selection != nil && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
 				}
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
-				multiTurnConsensusDeliver := false
-				if isMultiTurnContinuation && verdict == QualityWithhold && peekUsage.OutputTokens > 0 {
-					multiTurnSemanticWithholds++
-					if multiTurnSemanticWithholds >= 2 {
-						deferredPenalty = nil
-						discardFallback(false)
-						multiTurnConsensusDeliver = true
-						missingThinkingPenalized = true
-						commit = QualityCommit{Action: QualityActionDeliverLast, Audit: false, KeepBody: true}
-					}
-				}
-				if verdict == QualityDeliver && deferredPenalty != nil {
-					flushDeferredPenalty()
-				}
-				deferMultiTurnFirstWithhold := isMultiTurnContinuation && verdict == QualityWithhold && multiTurnSemanticWithholds == 1 && commit.Action == QualityActionRetry && holdCfg.OnExhausted != qualityRetryFailOpen
-				if deferMultiTurnFirstWithhold {
-					deferredPenalty = &deferredMissingThinking{
-						credential:        credential,
-						usage:             peekUsage,
-						upstreamStartedAt: responseStartedAt,
-					}
-				} else if verdict == QualityWithhold && !multiTurnConsensusDeliver {
-					flushDeferredPenalty()
+				if verdict == QualityWithhold {
 					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown, holdCfg.AutoDisable)
 					missingThinkingPenalized = true
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
-				if commit.Audit && !deferFailOpenAudit && !deferMultiTurnFirstWithhold {
+				if commit.Audit && !deferFailOpenAudit {
 					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, responseStartedAt, egressTrace, route.Provider)
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
-				} else if verdict == QualityWithhold && commit.Action == QualityActionDeliverLast && !multiTurnConsensusDeliver {
+				} else if verdict == QualityWithhold && commit.Action == QualityActionDeliverLast {
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
 				}
 				switch commit.Action {
@@ -1774,7 +1735,6 @@ attemptLoop:
 		}
 		return handoffResponse(response, lease, credential, responseStartedAt, false), nil
 	}
-	flushDeferredPenalty()
 	if fallback != nil {
 		if ctx.Err() == nil && holdCfg.OnExhausted == qualityRetryFailOpen {
 			selected := fallback

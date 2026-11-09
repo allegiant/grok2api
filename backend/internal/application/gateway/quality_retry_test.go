@@ -2107,9 +2107,9 @@ func TestObserveQualityChunkValidGrokEncryptedContentAndDoneSummaryDeliver(t *te
 	}
 }
 
-func TestAttemptLoopMultiTurnConsensusDeliversWithoutCoolingAccounts(t *testing.T) {
+func TestAttemptLoopMultiTurnWithholdsZeroReasoningUntilThinkingAccountSucceeds(t *testing.T) {
 	ctx := context.Background()
-	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-multiturn-consensus.db"))
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-multiturn-strict.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2123,8 +2123,8 @@ func TestAttemptLoopMultiTurnConsensusDeliversWithoutCoolingAccounts(t *testing.
 	responseRepo := relational.NewResponseRepository(database)
 	keyRepo := relational.NewClientKeyRepository(database)
 
-	credentials := make([]accountdomain.Credential, 0, 4)
-	for index, name := range []string{"mt-acct-1", "mt-acct-2", "mt-acct-3", "mt-acct-4"} {
+	credentials := make([]accountdomain.Credential, 0, 3)
+	for index, name := range []string{"mt-acct-1", "mt-acct-2", "mt-acct-3"} {
 		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
 			Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name,
 			EncryptedAccessToken: name, EncryptedRefreshToken: "refresh-" + name,
@@ -2145,7 +2145,7 @@ func TestAttemptLoopMultiTurnConsensusDeliversWithoutCoolingAccounts(t *testing.
 		}
 	}
 	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
-		Name: "mt-consensus-key", Prefix: "qmtc", SecretHash: strings.Repeat("c", 64),
+		Name: "mt-strict-key", Prefix: "qmts", SecretHash: strings.Repeat("c", 64),
 		EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
 	})
 	if err != nil {
@@ -2153,17 +2153,26 @@ func TestAttemptLoopMultiTurnConsensusDeliversWithoutCoolingAccounts(t *testing.
 	}
 
 	toolCallNoReasoning := sse(
-		`data: {"type":"response.created","response":{"id":"resp-mt","model":"grok-4.7"}}`,
+		`data: {"type":"response.created","response":{"id":"resp-mt-bad","model":"grok-4.7"}}`,
 		`data: {"type":"response.output_item.added","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":""}}`,
 		`data: {"type":"response.function_call_arguments.delta","delta":"{\"cmd\":\"pwd\"}"}`,
 		`data: {"type":"response.output_item.done","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":"{\"cmd\":\"pwd\"}"}}`,
-		`data: {"type":"response.completed","response":{"id":"resp-mt","model":"grok-4.7","usage":{"output_tokens":42,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+		`data: {"type":"response.completed","response":{"id":"resp-mt-bad","model":"grok-4.7","usage":{"output_tokens":42,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+	)
+	validCipher := testValidGrokEncryptedContent(13)
+	toolCallWithReasoning := sse(
+		`data: {"type":"response.created","response":{"id":"resp-mt-ok","model":"grok-4.7"}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_2","type":"reasoning"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_2","type":"reasoning","summary":[],"encrypted_content":"`+validCipher+`"}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":""}}`,
+		`data: {"type":"response.function_call_arguments.delta","delta":"{\"cmd\":\"pwd\"}"}`,
+		`data: {"type":"response.output_item.done","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":"{\"cmd\":\"pwd\"}"}}`,
+		`data: {"type":"response.completed","response":{"id":"resp-mt-ok","model":"grok-4.7","usage":{"output_tokens":142,"output_tokens_details":{"reasoning_tokens":100}}}}`,
 	)
 	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
 		credentials[0].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
 		credentials[1].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
-		credentials[2].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
-		credentials[3].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
+		credentials[2].ID: {{status: http.StatusOK, body: toolCallWithReasoning}},
 	}}
 	registry := provider.NewRegistry(adapter)
 	sticky := memory.NewStickyStore()
@@ -2177,29 +2186,29 @@ func TestAttemptLoopMultiTurnConsensusDeliversWithoutCoolingAccounts(t *testing.
 
 	multiTurnBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
 	result, err := service.CreateResponse(ctx, Input{
-		RequestID: "req-mt-consensus", ClientKey: clientKey, PublicModel: "grok-4.7",
+		RequestID: "req-mt-strict", ClientKey: clientKey, PublicModel: "grok-4.7",
 		Streaming: true, Body: multiTurnBody,
 	})
 	if err != nil {
-		t.Fatalf("multi-turn consensus should deliver instead of returning 503: %v", err)
+		t.Fatalf("multi-turn request should retry past 2 degraded accounts and deliver the 3rd thinking account: %v", err)
 	}
 	body, _ := io.ReadAll(result.Body)
-	result.Finalize(Usage{Reported: true, OutputTokens: 42, ReasoningTokens: 0}, "resp-mt", "")
+	result.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
 	_ = result.Body.Close()
-	if !strings.Contains(string(body), `"call_2"`) {
-		t.Fatalf("expected tool call body delivered, got %s", body)
+	if !strings.Contains(string(body), validCipher) {
+		t.Fatalf("expected thinking response from 3rd account, got %s", body)
 	}
 	attempts := adapter.Attempts()
-	if len(attempts) != 2 {
-		t.Fatalf("expected consensus after 2 accounts (not burning all 4), got attempts=%v", attempts)
+	if len(attempts) != 3 {
+		t.Fatalf("expected 3 attempts (2 withheld + 1 delivered), got attempts=%v", attempts)
 	}
-	for _, id := range attempts {
+	for _, id := range attempts[:2] {
 		acct, getErr := accountRepo.Get(ctx, id)
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
-			t.Fatalf("account %d should not be cooled down on prompt-induced multi-turn 0-reasoning consensus: %#v", id, acct)
+		if acct.CooldownUntil == nil || acct.LastError != lastErrorMissingThinking {
+			t.Fatalf("degraded account %d must be cooled down: %#v", id, acct)
 		}
 	}
 }
