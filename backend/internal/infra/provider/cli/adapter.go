@@ -591,6 +591,9 @@ type responseCall struct {
 
 // doResponseRequest 发起一次真实 Responses 上游调用，并保留该次调用自己的审计来源信息。
 func (a *Adapter) doResponseRequest(ctx context.Context, request provider.ResponseResourceRequest, accessToken string, body []byte, base string) (call responseCall) {
+	if request.QualityDiagnostic != nil {
+		request.QualityDiagnostic.UpstreamRequest = provider.SummarizeRequestShape(body, request.Operation)
+	}
 	startedAt := time.Now()
 	call = responseCall{upstreamURL: a.urlWithBase(base, request.Path), startedAt: startedAt.UTC()}
 	defer func() {

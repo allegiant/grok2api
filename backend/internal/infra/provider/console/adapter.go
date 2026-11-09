@@ -168,6 +168,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			return invalidConversationResponse(request.Operation, err), nil
 		}
 	}
+	if request.QualityDiagnostic != nil {
+		request.QualityDiagnostic.UpstreamRequest = provider.SummarizeRequestShape(body, request.Operation)
+	}
 	cfg := a.config()
 	requestCtx, totalCancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
 	var idleCancel context.CancelCauseFunc

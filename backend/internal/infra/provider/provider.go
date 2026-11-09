@@ -377,6 +377,16 @@ type ResponseResourceRequest struct {
 	// normalization used for the physical upstream request. The caller owns the
 	// value; adapters update it synchronously before network I/O.
 	NormalizedMetadata *NormalizedRequestMetadata
+	// QualityDiagnostic carries bounded, content-free request shape metadata only
+	// when the gateway's quality hold is active.
+	QualityDiagnostic *QualityRequestDiagnostic
+}
+
+// QualityRequestDiagnostic holds structural summaries for a single gateway
+// request. Adapters update UpstreamRequest only after final normalization.
+type QualityRequestDiagnostic struct {
+	IncomingRequest RequestShapeSummary
+	UpstreamRequest RequestShapeSummary
 }
 
 // NormalizedRequestMetadata contains safe request attributes that may be kept

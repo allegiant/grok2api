@@ -27,6 +27,30 @@ const (
 	qualityHoldMaxBufferBytes          = 8 << 20
 )
 
+const qualityDiagnosticMaxTypes = 32
+
+type qualityStreamDiagnostic struct {
+	Events                 []string `json:"events,omitempty"`
+	EventCount             int      `json:"event_count,omitempty"`
+	EventsTruncated        bool     `json:"events_truncated,omitempty"`
+	OutputItemTypes        []string `json:"output_item_types,omitempty"`
+	OutputItemsTruncated   bool     `json:"output_items_truncated,omitempty"`
+	ContentBlockTypes      []string `json:"content_block_types,omitempty"`
+	ContentBlocksTruncated bool     `json:"content_blocks_truncated,omitempty"`
+	DeltaTypes             []string `json:"delta_types,omitempty"`
+	DeltasTruncated        bool     `json:"deltas_truncated,omitempty"`
+	Terminal               bool     `json:"terminal"`
+	ReasoningStarted       bool     `json:"reasoning_started"`
+	HasThinking            bool     `json:"has_thinking"`
+	ReasoningPayloadBytes  int      `json:"reasoning_payload_bytes,omitempty"`
+	EncryptedContentValid  bool     `json:"encrypted_content_valid"`
+	UsageReported          bool     `json:"usage_reported"`
+}
+
+type qualityPeekMetadata struct {
+	Stream qualityStreamDiagnostic
+}
+
 type qualityScanState struct {
 	protocol                        string
 	pending                         []byte
@@ -42,10 +66,115 @@ type qualityScanState struct {
 	minEncryptedBytes               int
 	encryptedBytesPerReasoningToken int
 	usage                           Usage
-	responseID                      string
 	terminal                        bool
 	holdExpired                     bool
 	firstVisibleAt                  time.Time
+	diagnostic                      qualityStreamDiagnostic
+}
+
+func (s *qualityScanState) addDiagnosticEvent(value string) {
+	if s == nil {
+		return
+	}
+	s.diagnostic.EventCount++
+	appendQualityDiagnosticType(&s.diagnostic.Events, &s.diagnostic.EventsTruncated, safeQualityEventType(value))
+}
+
+func (s *qualityScanState) addDiagnosticOutputItem(value string) {
+	if s != nil {
+		appendQualityDiagnosticType(&s.diagnostic.OutputItemTypes, &s.diagnostic.OutputItemsTruncated, safeQualityOutputItemType(value))
+	}
+}
+
+func (s *qualityScanState) addDiagnosticContentBlock(value string) {
+	if s != nil {
+		appendQualityDiagnosticType(&s.diagnostic.ContentBlockTypes, &s.diagnostic.ContentBlocksTruncated, safeQualityContentType(value))
+	}
+}
+
+func (s *qualityScanState) addDiagnosticDelta(value string) {
+	if s != nil {
+		appendQualityDiagnosticType(&s.diagnostic.DeltaTypes, &s.diagnostic.DeltasTruncated, safeQualityDeltaType(value))
+	}
+}
+
+func appendQualityDiagnosticType(values *[]string, truncated *bool, value string) {
+	if values == nil || truncated == nil {
+		return
+	}
+	if len(*values) >= qualityDiagnosticMaxTypes {
+		*truncated = true
+		return
+	}
+	*values = append(*values, value)
+}
+
+func safeQualityEventType(value string) string {
+	switch value {
+	case "done", "chunk", "message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop", "ping", "error",
+		"response.created", "response.in_progress", "response.output_item.added", "response.output_item.done", "response.content_part.added", "response.content_part.done", "response.output_text.delta", "response.output_text.done", "response.reasoning_text.delta", "response.reasoning_text.done", "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done", "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done", "response.mcp_call_arguments.delta", "response.mcp_call_arguments.done", "response.completed", "response.incomplete", "response.failed":
+		return value
+	default:
+		return "other"
+	}
+}
+
+func safeQualityOutputItemType(value string) string {
+	switch value {
+	case "message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "computer_call", "computer_call_output", "shell_call", "shell_call_output", "local_shell_call", "mcp_call", "mcp_call_output", "web_search_call", "web_search_call_output", "image_generation_call", "code_interpreter_call", "text", "thinking", "tool_call", "tool_result", "finish_stop", "finish_tool_calls", "finish_length", "finish_function_call", "finish_content_filter", "finish_other":
+		return value
+	default:
+		return "other"
+	}
+}
+
+func safeChatFinishReason(value string) string {
+	switch value {
+	case "stop", "tool_calls", "length", "function_call", "content_filter":
+		return value
+	default:
+		return "other"
+	}
+}
+
+func safeQualityContentType(value string) string {
+	switch value {
+	case "text", "input_text", "output_text", "summary_text", "refusal", "tool_use", "tool_result", "image", "input_image", "output_image", "document", "file", "audio", "input_audio", "output_audio", "thinking", "redacted_thinking", "reasoning":
+		return value
+	default:
+		return "other"
+	}
+}
+
+func safeQualityDeltaType(value string) string {
+	switch value {
+	case "thinking_delta", "signature_delta", "text_delta", "input_json_delta":
+		return value
+	default:
+		return "other"
+	}
+}
+
+func marshalQualityDiagnosticJSON(value any) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+func (s *qualityScanState) peekMetadata() qualityPeekMetadata {
+	if s == nil {
+		return qualityPeekMetadata{}
+	}
+	stream := s.diagnostic
+	stream.Terminal = s.terminal
+	stream.ReasoningStarted = s.reasoningStarted
+	stream.HasThinking = s.hasThinking
+	stream.ReasoningPayloadBytes = s.encryptedBytes
+	stream.EncryptedContentValid = s.validEncryptedContent
+	stream.UsageReported = s.usage.Reported
+	return qualityPeekMetadata{Stream: stream}
 }
 
 type qualityReadResult struct {
@@ -245,6 +374,7 @@ func ObserveQualityChunk(state *qualityScanState, chunk []byte) {
 		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
 		if bytes.Equal(payload, []byte("[DONE]")) {
 			state.terminal = true
+			state.addDiagnosticEvent("done")
 			continue
 		}
 		observeQualityPayload(state, payload)
@@ -264,7 +394,6 @@ func observeQualityPayload(state *qualityScanState, payload []byte) {
 
 func observeQualityChat(state *qualityScanState, payload []byte) {
 	var event struct {
-		ID      string `json:"id"`
 		Model   string `json:"model"`
 		Choices []struct {
 			Delta struct {
@@ -289,9 +418,7 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 	if json.Unmarshal(payload, &event) != nil {
 		return
 	}
-	if state.responseID == "" {
-		state.responseID = event.ID
-	}
+	state.addDiagnosticEvent("chunk")
 	if event.Usage != nil {
 		state.usage.Reported = true
 		state.usage.InputTokens = event.Usage.PromptTokens
@@ -306,15 +433,19 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 		delta := choice.Delta
 		if strings.TrimSpace(delta.Reasoning) != "" || strings.TrimSpace(delta.ReasoningContent) != "" || strings.TrimSpace(delta.ThinkingContent) != "" {
 			state.hasThinking = true
+			state.addDiagnosticOutputItem("thinking")
 		}
 		if delta.Content != "" {
 			noteVisibleContent(state, delta.Content)
+			state.addDiagnosticOutputItem("text")
 		}
 		if len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
 			state.semanticOutput = true
+			state.addDiagnosticOutputItem("tool_call")
 		}
 		if choice.FinishReason != "" {
 			state.terminal = true
+			state.addDiagnosticOutputItem("finish_" + safeChatFinishReason(choice.FinishReason))
 		}
 	}
 }
@@ -489,6 +620,38 @@ func noteResponsesReasoningItem(state *qualityScanState, item qualityResponsesOu
 	noteEncryptedBytes(state, item.EncryptedContent)
 }
 
+func recordResponsesItemShape(state *qualityScanState, item qualityResponsesOutputItem) {
+	if state == nil {
+		return
+	}
+	state.addDiagnosticOutputItem(item.Type)
+	recordResponsesContentTypes(state, item.Content, "text")
+	recordResponsesContentTypes(state, item.Summary, "summary_text")
+}
+
+func recordResponsesContentTypes(state *qualityScanState, raw json.RawMessage, scalarType string) {
+	if state == nil || len(raw) == 0 || string(raw) == "null" {
+		return
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		if text != "" {
+			state.addDiagnosticContentBlock(scalarType)
+		}
+		return
+	}
+	var parts []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		state.addDiagnosticContentBlock("other")
+		return
+	}
+	for _, part := range parts {
+		state.addDiagnosticContentBlock(part.Type)
+	}
+}
+
 func observeQualityResponses(state *qualityScanState, payload []byte) {
 	var event struct {
 		Type     string                 `json:"type"`
@@ -498,7 +661,6 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 		Item     json.RawMessage        `json:"item"`
 		Usage    *qualityResponsesUsage `json:"usage"`
 		Response *struct {
-			ID     string                 `json:"id"`
 			Model  string                 `json:"model"`
 			Output []json.RawMessage      `json:"output"`
 			Usage  *qualityResponsesUsage `json:"usage"`
@@ -506,6 +668,9 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 	}
 	if json.Unmarshal(payload, &event) != nil {
 		return
+	}
+	if event.Type != "" {
+		state.addDiagnosticEvent(event.Type)
 	}
 	deltaText := ""
 	if len(event.Delta) > 0 {
@@ -515,10 +680,12 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 	case "response.completed", "response.incomplete", "response.failed":
 		state.terminal = true
 	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+		state.addDiagnosticContentBlock("reasoning")
 		if strings.TrimSpace(deltaText) != "" {
 			state.hasThinking = true
 		}
 	case "response.reasoning_text.done", "response.reasoning_summary_text.done":
+		state.addDiagnosticContentBlock("reasoning")
 		if strings.TrimSpace(event.Text) != "" || strings.TrimSpace(deltaText) != "" {
 			state.hasThinking = true
 		}
@@ -529,10 +696,12 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 	case "response.output_item.added", "response.output_item.done":
 		var item qualityResponsesOutputItem
 		if len(event.Item) > 0 && json.Unmarshal(event.Item, &item) == nil {
+			recordResponsesItemShape(state, item)
 			noteResponsesReasoningItem(state, item)
 			state.aggregateRunes = max(state.aggregateRunes, observeQualityResponsesOutputItem(state, item))
 		}
 	case "response.output_text.delta":
+		state.addDiagnosticContentBlock("output_text")
 		if deltaText != "" {
 			noteVisibleContent(state, deltaText)
 		}
@@ -540,14 +709,19 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 		if deltaText != "" {
 			state.semanticOutput = true
 		}
+		switch event.Type {
+		case "response.function_call_arguments.delta":
+			state.addDiagnosticOutputItem("function_call")
+		case "response.custom_tool_call_input.delta":
+			state.addDiagnosticOutputItem("custom_tool_call")
+		case "response.mcp_call_arguments.delta":
+			state.addDiagnosticOutputItem("mcp_call")
+		}
 	}
 	if event.Usage != nil && (event.Response == nil || event.Response.Usage == nil) {
 		event.Usage.applyTo(state, "")
 	}
 	if event.Response != nil {
-		if state.responseID == "" {
-			state.responseID = event.Response.ID
-		}
 		if event.Response.Usage != nil {
 			event.Response.Usage.applyTo(state, event.Response.Model)
 		}
@@ -557,6 +731,7 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 			if json.Unmarshal(rawItem, &item) != nil {
 				continue
 			}
+			recordResponsesItemShape(state, item)
 			noteResponsesReasoningItem(state, item)
 			aggregateRunes += observeQualityResponsesOutputItem(state, item)
 		}
@@ -638,10 +813,14 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 	if json.Unmarshal(payload, &event) != nil {
 		return
 	}
+	if event.Type != "" {
+		state.addDiagnosticEvent(event.Type)
+	}
 	switch event.Type {
 	case "message_stop":
 		state.terminal = true
 	case "content_block_start":
+		state.addDiagnosticContentBlock(event.ContentBlock.Type)
 		switch event.ContentBlock.Type {
 		case "thinking":
 			state.reasoningStarted = true
@@ -658,6 +837,7 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 			state.semanticOutput = true
 		}
 	case "content_block_delta":
+		state.addDiagnosticDelta(event.Delta.Type)
 		if event.Delta.Type == "thinking_delta" && strings.TrimSpace(event.Delta.Thinking) != "" {
 			state.hasThinking = true
 		}
@@ -693,10 +873,10 @@ func noteVisibleContent(state *qualityScanState, text string) {
 	state.visibleRunes += utf8.RuneCountInString(text)
 }
 
-func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
+func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, qualityPeekMetadata, error) {
 	cfg = normalizeQualityRetry(cfg)
 	if body == nil {
-		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
+		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, qualityPeekMetadata{}, errQualityEmptyStream
 	}
 	pump := newQualityReadPump(body)
 	state := qualityScanState{
@@ -710,7 +890,7 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 	for {
 		sig := state.signals()
 		if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
-			return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
+			return newPrefixReplay(&held, pump), verdict, state.usage, state.peekMetadata(), nil
 		}
 		// A completed empty stream must rotate immediately. Waiting for idle
 		// timeout after response.completed / [DONE] surfaces HTTP 200 with 0
@@ -723,12 +903,12 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 		case <-ctx.Done():
 			reasoningreplay.DiscardCapture(pump)
 			_ = pump.Close()
-			return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, ctx.Err())
+			return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.peekMetadata(), qualityPeekAbortError(ctx, ctx.Err())
 		case <-holdTimer.C:
 			state.holdExpired = true
 			sig.HoldExpired = true
 			if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
-				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
+				return newPrefixReplay(&held, pump), verdict, state.usage, state.peekMetadata(), nil
 			}
 		case result, ok := <-pump.results:
 			if !ok {
@@ -737,7 +917,7 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 			if len(result.data) > 0 {
 				if held.Len()+len(result.data) > qualityHoldMaxBufferBytes {
 					_, _ = held.Write(result.data)
-					return newPrefixReplay(&held, pump), QualityDeliver, state.usage, state.responseID, nil
+					return newPrefixReplay(&held, pump), QualityDeliver, state.usage, state.peekMetadata(), nil
 				}
 				_, _ = held.Write(result.data)
 				ObserveQualityChunk(&state, result.data)
@@ -748,15 +928,15 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 			if result.err != nil {
 				reasoningreplay.DiscardCapture(pump)
 				_ = pump.Close()
-				return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, result.err)
+				return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.peekMetadata(), qualityPeekAbortError(ctx, result.err)
 			}
 		}
 	}
 }
 
-func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
+func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, qualityPeekMetadata, error) {
 	if state == nil {
-		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
+		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, qualityPeekMetadata{}, errQualityEmptyStream
 	}
 	if len(state.pending) > 0 {
 		// Process a final valid SSE data line even when the upstream omitted its
@@ -768,13 +948,13 @@ func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *quality
 	if !qualityHasValidThinking(signals) && signals.ReasoningTokens <= 0 && signals.OutputTokens <= 0 && signals.VisibleTokens <= 0 {
 		if state.semanticOutput {
 			if signals.ReasoningStarted || signals.EncryptedBytes > 0 {
-				return newPrefixReplay(held, pump), QualityWithhold, state.usage, state.responseID, nil
+				return newPrefixReplay(held, pump), QualityWithhold, state.usage, state.peekMetadata(), nil
 			}
-			return newPrefixReplay(held, pump), QualityDeliver, state.usage, state.responseID, nil
+			return newPrefixReplay(held, pump), QualityDeliver, state.usage, state.peekMetadata(), nil
 		}
-		return newPrefixReplay(held, pump), QualityWait, state.usage, state.responseID, errQualityEmptyStream
+		return newPrefixReplay(held, pump), QualityWait, state.usage, state.peekMetadata(), errQualityEmptyStream
 	}
-	return newPrefixReplay(held, pump), ClassifyQualityHold(signals, cfg.MinOutputTokens), state.usage, state.responseID, nil
+	return newPrefixReplay(held, pump), ClassifyQualityHold(signals, cfg.MinOutputTokens), state.usage, state.peekMetadata(), nil
 }
 
 func newPrefixReplay(held *bytes.Buffer, rest io.ReadCloser) io.ReadCloser {

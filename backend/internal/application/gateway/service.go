@@ -1046,13 +1046,19 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	var lastFailure *UpstreamFailure
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
 	normalizedMetadata := &provider.NormalizedRequestMetadata{}
+	var qualityDiagnostic *provider.QualityRequestDiagnostic
+	if qualityHoldEnabled {
+		qualityDiagnostic = &provider.QualityRequestDiagnostic{
+			IncomingRequest: provider.SummarizeRequestShape(input.Body, string(operation)),
+		}
+	}
 	responseStartedAt := startedAt
 	transientRetry := 0
 	forwardResponse := func(lease *accountLease, credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
 		responseStartedAt = started
 		lease.markSelectorUpstreamStarted()
-		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, TransientRetry: transientRetry, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
+		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, TransientRetry: transientRetry, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata, QualityDiagnostic: qualityDiagnostic})
 		auditBase.ReasoningEffort = normalizedMetadata.ReasoningEffort
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
@@ -1603,7 +1609,7 @@ attemptLoop:
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			missingThinkingPenalized := false
 			if qualityHoldEnabled {
-				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
+				replay, verdict, peekUsage, peekMetadata, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
 				if peekErr != nil {
 					if replay != nil {
 						reasoningreplay.DiscardCapture(replay)
@@ -1647,6 +1653,23 @@ attemptLoop:
 				}
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
 				if verdict == QualityWithhold {
+					incomingShape := provider.RequestShapeSummary{}
+					upstreamShape := provider.RequestShapeSummary{}
+					if qualityDiagnostic != nil {
+						incomingShape = qualityDiagnostic.IncomingRequest
+						upstreamShape = qualityDiagnostic.UpstreamRequest
+					}
+					s.logger.Info("quality_degraded_diagnostic",
+						"request_id", input.RequestID,
+						"account_id", credential.ID,
+						"quality_attempt", qualityAccountAttempts,
+						"protocol", qualityProtocolForOperation(operation),
+						"incoming_request_shape", marshalQualityDiagnosticJSON(incomingShape),
+						"upstream_request_shape", marshalQualityDiagnosticJSON(upstreamShape),
+						"response_stream_shape", marshalQualityDiagnosticJSON(peekMetadata.Stream),
+						"output_tokens", peekUsage.OutputTokens,
+						"reasoning_tokens", peekUsage.ReasoningTokens,
+					)
 					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown, holdCfg.AutoDisable)
 					missingThinkingPenalized = true
 				}
