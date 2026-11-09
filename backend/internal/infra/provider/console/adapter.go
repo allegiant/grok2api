@@ -196,7 +196,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		return nil, err
 	}
 	if request.QualityDiagnostic != nil && request.Streaming && response.StatusCode >= 200 && response.StatusCode < 300 &&
-		(request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages) {
+		(request.Operation == conversation.OperationChat ||
+			request.Operation == conversation.OperationMessages ||
+			request.Operation == conversation.OperationResponses) {
 		response.Body = request.QualityDiagnostic.ObserveUpstreamResponses(response.Body)
 	}
 	if idleCancel != nil && response.StatusCode >= 200 && response.StatusCode < 300 && response.Body != nil {

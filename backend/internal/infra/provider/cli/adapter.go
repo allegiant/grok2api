@@ -422,7 +422,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		}
 	}
 	if request.QualityDiagnostic != nil && request.Streaming && isHTTPSuccess(resp.StatusCode) &&
-		(request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages) {
+		(request.Operation == conversation.OperationChat ||
+			request.Operation == conversation.OperationMessages ||
+			request.Operation == conversation.OperationResponses) {
 		resp.Body = request.QualityDiagnostic.ObserveUpstreamResponses(resp.Body)
 	}
 	if request.Streaming && isHTTPSuccess(resp.StatusCode) && resp.Body != nil {

@@ -433,6 +433,27 @@ func TestForwardMessagesCapturesRawUpstreamResponsesBeforeConversion(t *testing.
 			t.Fatalf("raw upstream summary leaked %q: %s", secret, encoded)
 		}
 	}
+
+	// Native Responses requests need the same raw upstream observation as
+	// Chat/Messages conversions so diagnostics can distinguish provider output
+	// from later response compatibility handling.
+	nativeDiagnostic := &provider.QualityRequestDiagnostic{}
+	nativeResponse, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: account.Credential{ID: 1, EncryptedAccessToken: encrypted},
+		Method:     http.MethodPost, Path: "/responses", Model: "grok-4.6", Operation: conversation.OperationResponses,
+		Body: []byte(`{}`), Streaming: true, QualityDiagnostic: nativeDiagnostic,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nativeResponse.Body.Close()
+	if _, err := io.ReadAll(nativeResponse.Body); err != nil {
+		t.Fatal(err)
+	}
+	_, _, nativeRaw := nativeDiagnostic.Snapshot()
+	if nativeRaw.FunctionCallItemEvents == 0 || nativeRaw.OutputTokens != 18 || !nativeRaw.Terminal {
+		t.Fatalf("native Responses raw upstream summary = %#v", nativeRaw)
+	}
 }
 
 func TestNormalizeGrokTurnIndex(t *testing.T) {
