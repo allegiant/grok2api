@@ -386,11 +386,12 @@ type ResponseResourceRequest struct {
 // QualityRequestDiagnostic holds structural summaries for one quality-guarded
 // request. Raw response events are observed concurrently by the stream adapter.
 type QualityRequestDiagnostic struct {
-	mu              sync.Mutex
-	incomingRequest RequestShapeSummary
-	upstreamRequest RequestShapeSummary
-	rawResponse     RawResponsesStreamSummary
-	rawEventBuffer  rawResponsesEventBuffer
+	mu                        sync.Mutex
+	incomingRequest           RequestShapeSummary
+	upstreamRequest           RequestShapeSummary
+	responsesHistoryIntegrity *ResponsesHistoryIntegritySummary
+	rawResponse               RawResponsesStreamSummary
+	rawEventBuffer            rawResponsesEventBuffer
 }
 
 // SetIncomingRequest records the client request shape before provider conversion.
@@ -413,6 +414,33 @@ func (d *QualityRequestDiagnostic) SetUpstreamRequest(shape RequestShapeSummary)
 	d.mu.Unlock()
 }
 
+func (d *QualityRequestDiagnostic) SetResponsesHistoryIntegrity(summary *ResponsesHistoryIntegritySummary) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	if summary == nil {
+		d.responsesHistoryIntegrity = nil
+	} else {
+		copy := *summary
+		d.responsesHistoryIntegrity = &copy
+	}
+	d.mu.Unlock()
+}
+
+func (d *QualityRequestDiagnostic) ResponsesHistoryIntegritySnapshot() *ResponsesHistoryIntegritySummary {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.responsesHistoryIntegrity == nil {
+		return nil
+	}
+	copy := *d.responsesHistoryIntegrity
+	return &copy
+}
+
 // ResetUpstreamAttempt clears per-attempt observations while preserving the
 // original client request shape for the next account retry.
 func (d *QualityRequestDiagnostic) ResetUpstreamAttempt() {
@@ -421,6 +449,7 @@ func (d *QualityRequestDiagnostic) ResetUpstreamAttempt() {
 	}
 	d.mu.Lock()
 	d.upstreamRequest = RequestShapeSummary{}
+	d.responsesHistoryIntegrity = nil
 	d.rawResponse = RawResponsesStreamSummary{}
 	d.rawEventBuffer = rawResponsesEventBuffer{}
 	d.mu.Unlock()

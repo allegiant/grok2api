@@ -78,11 +78,72 @@ func TestObserveUpstreamResponsesPreservesBytesAndRedactsSummary(t *testing.T) {
 	}
 }
 
+func TestCompareResponsesRequestHistoryReportsSafePreservation(t *testing.T) {
+	incoming := []byte(`{"previous_response_id":"PRIVATE_RESPONSE_ID","tools":[{"type":"function","name":"PRIVATE_TOOL"}],"input":[{"type":"reasoning","encrypted_content":"PRIVATE_ENCRYPTED_CONTENT"},{"type":"function_call","call_id":"PRIVATE_CALL_ID","name":"PRIVATE_TOOL","arguments":"PRIVATE_ARGUMENTS"},{"type":"function_call_output","call_id":"PRIVATE_CALL_ID","output":"PRIVATE_TOOL_OUTPUT"}]}`)
+	upstream := []byte(`{"previous_response_id":"PRIVATE_RESPONSE_ID","tools":[{"type":"function","name":"PRIVATE_TOOL"},{"type":"x_search"}],"input":[{"type":"reasoning","encrypted_content":"PRIVATE_ENCRYPTED_CONTENT"},{"type":"function_call","call_id":"PRIVATE_CALL_ID","name":"PRIVATE_TOOL","arguments":"PRIVATE_ARGUMENTS"},{"type":"function_call_output","call_id":"PRIVATE_CALL_ID","output":"PRIVATE_TOOL_OUTPUT"}]}`)
+
+	summary := CompareResponsesRequestHistory(incoming, upstream, "responses")
+	if summary == nil || !summary.Comparable || summary.IncomingInputItems != 3 || summary.UpstreamInputItems != 3 || !summary.InputItemOrderMatch {
+		t.Fatalf("unexpected input history comparison: %#v", summary)
+	}
+	if summary.IncomingReasoningItems != 1 || summary.UpstreamReasoningItems != 1 || summary.IncomingEncryptedReasoningItems != 1 || summary.UpstreamEncryptedReasoningItems != 1 || !summary.EncryptedReasoningContentMatch {
+		t.Fatalf("encrypted reasoning was not reported as preserved: %#v", summary)
+	}
+	if summary.IncomingToolCallItems != 1 || summary.UpstreamToolCallItems != 1 || summary.IncomingToolCallOutputItems != 1 || summary.UpstreamToolCallOutputItems != 1 || !summary.ToolCallReferencesMatch {
+		t.Fatalf("tool call/result references were not reported as preserved: %#v", summary)
+	}
+	if !summary.PreviousResponseIDSeen || !summary.PreviousResponseIDMatch || !summary.XSearchInjected {
+		t.Fatalf("request controls were not compared: %#v", summary)
+	}
+	if SummarizeRequestShape(incoming, "responses").XSearchToolPresent || !SummarizeRequestShape(upstream, "responses").XSearchToolPresent {
+		t.Fatal("request shape must expose only whether the upstream added x_search")
+	}
+
+	encoded, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"PRIVATE_RESPONSE_ID", "PRIVATE_ENCRYPTED_CONTENT", "PRIVATE_CALL_ID", "PRIVATE_TOOL", "PRIVATE_ARGUMENTS", "PRIVATE_TOOL_OUTPUT"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("history integrity summary leaked %q: %s", secret, encoded)
+		}
+	}
+}
+
+func TestCompareResponsesRequestHistoryDetectsChangesWithoutLeakingValues(t *testing.T) {
+	incoming := []byte(`{"input":[{"type":"reasoning","encrypted_content":"PRIVATE_OLD_CIPHERTEXT"},{"type":"function_call","call_id":"PRIVATE_OLD_CALL"},{"type":"function_call_output","call_id":"PRIVATE_OLD_CALL","output":"PRIVATE_OUTPUT"}]}`)
+	upstream := []byte(`{"tools":[{"type":"x_search"}],"input":[{"type":"function_call","call_id":"PRIVATE_NEW_CALL"},{"type":"reasoning","encrypted_content":"PRIVATE_NEW_CIPHERTEXT"},{"type":"function_call_output","call_id":"PRIVATE_NEW_CALL","output":"PRIVATE_OUTPUT"}]}`)
+
+	summary := CompareResponsesRequestHistory(incoming, upstream, "responses")
+	if summary == nil || !summary.Comparable || summary.InputItemOrderMatch || summary.EncryptedReasoningContentMatch || summary.ToolCallReferencesMatch || !summary.XSearchInjected {
+		t.Fatalf("history changes were not detected: %#v", summary)
+	}
+	encoded, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"PRIVATE_OLD_CIPHERTEXT", "PRIVATE_NEW_CIPHERTEXT", "PRIVATE_OLD_CALL", "PRIVATE_NEW_CALL", "PRIVATE_OUTPUT"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("history mismatch summary leaked %q: %s", secret, encoded)
+		}
+	}
+}
+
+func TestCompareResponsesRequestHistorySkipsNonResponsesPayloads(t *testing.T) {
+	if summary := CompareResponsesRequestHistory([]byte(`{"messages":[]}`), []byte(`{"messages":[]}`), "messages"); summary != nil {
+		t.Fatalf("non-Responses history should not be compared: %#v", summary)
+	}
+	if summary := CompareResponsesRequestHistory([]byte(`{"input":"hello"}`), []byte(`{"input":"hello"}`), "responses"); summary == nil || summary.Comparable {
+		t.Fatalf("string input should be marked non-comparable: %#v", summary)
+	}
+}
+
 func TestResetUpstreamAttemptPreservesIncomingAndClearsAttemptState(t *testing.T) {
 	incoming := SummarizeRequestShape([]byte(`{"input":"PRIVATE_PROMPT"}`), "responses")
 	diagnostic := &QualityRequestDiagnostic{}
 	diagnostic.SetIncomingRequest(incoming)
 	diagnostic.SetUpstreamRequest(incoming)
+	diagnostic.SetResponsesHistoryIntegrity(&ResponsesHistoryIntegritySummary{Comparable: true})
 	body := diagnostic.ObserveUpstreamResponses(io.NopCloser(strings.NewReader(`data: {"type":"response.created"}` + "\n\n")))
 	if _, err := io.Copy(io.Discard, body); err != nil {
 		t.Fatal(err)
@@ -101,6 +162,9 @@ func TestResetUpstreamAttemptPreservesIncomingAndClearsAttemptState(t *testing.T
 	}
 	if raw.EventCount != 0 || len(raw.Events) != 0 || raw.Terminal || raw.UsageReported {
 		t.Fatalf("raw response state was not reset: %#v", raw)
+	}
+	if diagnostic.ResponsesHistoryIntegritySnapshot() != nil {
+		t.Fatal("history integrity must be reset between account attempts")
 	}
 }
 

@@ -8,10 +8,11 @@ import (
 )
 
 const (
-	maxRequestShapeBodyBytes    = 8 << 20
-	maxRequestShapeItems        = 24
-	maxRequestShapeContentTypes = 12
-	maxRequestShapeToolCount    = 10000
+	maxRequestShapeBodyBytes        = 8 << 20
+	maxRequestShapeItems            = 24
+	maxRequestShapeContentTypes     = 12
+	maxRequestShapeToolCount        = 10000
+	maxResponsesHistoryCompareItems = 4096
 )
 
 // RequestShapeSummary contains only protocol labels, bounded counts, and
@@ -22,6 +23,7 @@ type RequestShapeSummary struct {
 	PayloadBytes           int                `json:"payload_bytes,omitempty"`
 	Items                  []RequestShapeItem `json:"items,omitempty"`
 	ToolDefinitions        int                `json:"tool_definitions,omitempty"`
+	XSearchToolPresent     bool               `json:"x_search_tool_present,omitempty"`
 	ReasoningEffort        string             `json:"reasoning_effort,omitempty"`
 	OutputConfigEffort     string             `json:"output_config_effort,omitempty"`
 	ReasoningSummary       string             `json:"reasoning_summary,omitempty"`
@@ -49,6 +51,29 @@ type RequestShapeItem struct {
 	SignatureBytes        int      `json:"signature_bytes,omitempty"`
 }
 
+// ResponsesHistoryIntegritySummary records only counts and equality results;
+// it never retains request text, tool identifiers, arguments, or ciphertext.
+type ResponsesHistoryIntegritySummary struct {
+	Comparable                      bool `json:"comparable"`
+	Truncated                       bool `json:"truncated,omitempty"`
+	IncomingInputItems              int  `json:"incoming_input_items,omitempty"`
+	UpstreamInputItems              int  `json:"upstream_input_items,omitempty"`
+	InputItemOrderMatch             bool `json:"input_item_order_match"`
+	IncomingReasoningItems          int  `json:"incoming_reasoning_items,omitempty"`
+	UpstreamReasoningItems          int  `json:"upstream_reasoning_items,omitempty"`
+	IncomingEncryptedReasoningItems int  `json:"incoming_encrypted_reasoning_items,omitempty"`
+	UpstreamEncryptedReasoningItems int  `json:"upstream_encrypted_reasoning_items,omitempty"`
+	EncryptedReasoningContentMatch  bool `json:"encrypted_reasoning_content_match"`
+	IncomingToolCallItems           int  `json:"incoming_tool_call_items,omitempty"`
+	UpstreamToolCallItems           int  `json:"upstream_tool_call_items,omitempty"`
+	IncomingToolCallOutputItems     int  `json:"incoming_tool_call_output_items,omitempty"`
+	UpstreamToolCallOutputItems     int  `json:"upstream_tool_call_output_items,omitempty"`
+	ToolCallReferencesMatch         bool `json:"tool_call_references_match"`
+	PreviousResponseIDSeen          bool `json:"previous_response_id_seen"`
+	PreviousResponseIDMatch         bool `json:"previous_response_id_match"`
+	XSearchInjected                 bool `json:"x_search_injected"`
+}
+
 // SummarizeRequestShape extracts a bounded structural view of supported
 // Messages, Chat Completions, or Responses request JSON. Unknown labels are
 // collapsed to "other" so clients cannot smuggle arbitrary strings into logs.
@@ -70,6 +95,7 @@ func SummarizeRequestShape(body []byte, operation string) RequestShapeSummary {
 	summarizeRequestControls(&shape, root)
 	if tools := rawArrayLength(root["tools"]); tools > 0 {
 		shape.ToolDefinitions = tools
+		shape.XSearchToolPresent = requestHasXSearchTool(root["tools"])
 	}
 	if system, ok := root["system"]; ok {
 		shape.appendItem(summarizeRequestItem(system, "system", ""))
@@ -104,6 +130,219 @@ func SummarizeRequestShape(body []byte, operation string) RequestShapeSummary {
 		}
 	}
 	return shape
+}
+
+// CompareResponsesRequestHistory compares protected history fields in memory and
+// returns only counts and booleans suitable for structured logging.
+func CompareResponsesRequestHistory(incoming, upstream []byte, operation string) *ResponsesHistoryIntegritySummary {
+	if requestShapeProtocol(operation) != "responses" {
+		return nil
+	}
+	summary := &ResponsesHistoryIntegritySummary{}
+	if len(incoming) > maxRequestShapeBodyBytes || len(upstream) > maxRequestShapeBodyBytes {
+		summary.Truncated = true
+		return summary
+	}
+	incomingRoot, incomingValid := decodeResponsesRequestRoot(incoming)
+	upstreamRoot, upstreamValid := decodeResponsesRequestRoot(upstream)
+	if incomingValid && upstreamValid {
+		incomingID, incomingIDSeen, incomingIDValid := responsesPreviousID(incomingRoot)
+		upstreamID, upstreamIDSeen, upstreamIDValid := responsesPreviousID(upstreamRoot)
+		summary.PreviousResponseIDSeen = incomingIDSeen || upstreamIDSeen
+		summary.PreviousResponseIDMatch = incomingIDSeen == upstreamIDSeen && incomingIDValid && upstreamIDValid && incomingID == upstreamID
+		summary.XSearchInjected = !requestHasXSearchTool(incomingRoot["tools"]) && requestHasXSearchTool(upstreamRoot["tools"])
+	}
+
+	incomingHistory, incomingComparable, incomingTruncated := decodeResponsesHistory(incomingRoot, incomingValid)
+	upstreamHistory, upstreamComparable, upstreamTruncated := decodeResponsesHistory(upstreamRoot, upstreamValid)
+	summary.Truncated = incomingTruncated || upstreamTruncated
+	if incomingComparable {
+		summary.IncomingInputItems = incomingHistory.itemCount
+		summary.IncomingReasoningItems = incomingHistory.reasoningItems
+		summary.IncomingEncryptedReasoningItems = incomingHistory.encryptedReasoningItems
+		summary.IncomingToolCallItems = incomingHistory.toolCallItems
+		summary.IncomingToolCallOutputItems = incomingHistory.toolCallOutputItems
+	}
+	if upstreamComparable {
+		summary.UpstreamInputItems = upstreamHistory.itemCount
+		summary.UpstreamReasoningItems = upstreamHistory.reasoningItems
+		summary.UpstreamEncryptedReasoningItems = upstreamHistory.encryptedReasoningItems
+		summary.UpstreamToolCallItems = upstreamHistory.toolCallItems
+		summary.UpstreamToolCallOutputItems = upstreamHistory.toolCallOutputItems
+	}
+	if !incomingComparable || !upstreamComparable {
+		return summary
+	}
+
+	summary.Comparable = true
+	summary.InputItemOrderMatch = equalResponsesHistoryItems(incomingHistory.items, upstreamHistory.items)
+	summary.EncryptedReasoningContentMatch = equalEncryptedReasoning(incomingHistory.reasoning, upstreamHistory.reasoning)
+	summary.ToolCallReferencesMatch = equalResponsesToolReferences(incomingHistory.toolReferences, upstreamHistory.toolReferences)
+	return summary
+}
+
+type responsesHistoryItem struct {
+	typeName string
+	role     string
+}
+
+type encryptedReasoningValue struct {
+	present bool
+	valid   bool
+	content string
+}
+
+type responsesToolReference struct {
+	typeName string
+	id       string
+	callID   string
+}
+
+type responsesRequestHistory struct {
+	itemCount               int
+	items                   []responsesHistoryItem
+	reasoningItems          int
+	encryptedReasoningItems int
+	reasoning               []encryptedReasoningValue
+	toolCallItems           int
+	toolCallOutputItems     int
+	toolReferences          []responsesToolReference
+}
+
+func decodeResponsesRequestRoot(body []byte) (map[string]json.RawMessage, bool) {
+	var root map[string]json.RawMessage
+	if len(body) == 0 || json.Unmarshal(body, &root) != nil || root == nil {
+		return nil, false
+	}
+	return root, true
+}
+
+func responsesPreviousID(root map[string]json.RawMessage) (string, bool, bool) {
+	raw, seen := root["previous_response_id"]
+	if !seen {
+		return "", false, true
+	}
+	var id string
+	if json.Unmarshal(raw, &id) != nil {
+		return "", true, false
+	}
+	return id, true, true
+}
+
+func decodeResponsesHistory(root map[string]json.RawMessage, rootValid bool) (responsesRequestHistory, bool, bool) {
+	if !rootValid {
+		return responsesRequestHistory{}, false, false
+	}
+	rawInput := bytes.TrimSpace(root["input"])
+	if len(rawInput) == 0 || rawInput[0] != '[' {
+		return responsesRequestHistory{}, false, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(rawInput))
+	if _, err := decoder.Token(); err != nil {
+		return responsesRequestHistory{}, false, false
+	}
+	history := responsesRequestHistory{}
+	for decoder.More() {
+		if history.itemCount >= maxResponsesHistoryCompareItems {
+			return history, false, true
+		}
+		var rawItem json.RawMessage
+		if decoder.Decode(&rawItem) != nil {
+			return responsesRequestHistory{}, false, false
+		}
+		history.itemCount++
+		var item map[string]json.RawMessage
+		if json.Unmarshal(rawItem, &item) != nil || item == nil {
+			history.items = append(history.items, responsesHistoryItem{})
+			continue
+		}
+		typeName := rawString(item["type"])
+		history.items = append(history.items, responsesHistoryItem{typeName: typeName, role: rawString(item["role"])})
+		if typeName == "reasoning" {
+			history.reasoningItems++
+			rawEncrypted, present := item["encrypted_content"]
+			value := encryptedReasoningValue{present: present, valid: !present}
+			if present {
+				history.encryptedReasoningItems++
+				value.valid = json.Unmarshal(rawEncrypted, &value.content) == nil
+			}
+			history.reasoning = append(history.reasoning, value)
+		}
+		if isResponsesToolCallType(typeName) {
+			history.toolCallItems++
+			history.toolReferences = append(history.toolReferences, responsesToolReference{
+				typeName: typeName,
+				id:       rawString(item["id"]),
+				callID:   rawString(item["call_id"]),
+			})
+			continue
+		}
+		if isResponsesToolOutputType(typeName) {
+			history.toolCallOutputItems++
+			history.toolReferences = append(history.toolReferences, responsesToolReference{
+				typeName: typeName,
+				callID:   rawString(item["call_id"]),
+			})
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return responsesRequestHistory{}, false, false
+	}
+	return history, true, false
+}
+
+func isResponsesToolCallType(typeName string) bool {
+	switch typeName {
+	case "function_call", "custom_tool_call", "computer_call", "shell_call", "local_shell_call", "mcp_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isResponsesToolOutputType(typeName string) bool {
+	switch typeName {
+	case "function_call_output", "custom_tool_call_output", "computer_call_output", "shell_call_output", "mcp_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
+func equalResponsesHistoryItems(left, right []responsesHistoryItem) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalEncryptedReasoning(left, right []encryptedReasoningValue) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if !left[i].valid || !right[i].valid || left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalResponsesToolReferences(left, right []responsesToolReference) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func requestShapeProtocol(operation string) string {
@@ -383,6 +622,22 @@ func rawString(raw json.RawMessage) string {
 
 func rawStringLength(raw json.RawMessage) int {
 	return len(rawString(raw))
+}
+
+func requestHasXSearchTool(raw json.RawMessage) bool {
+	var tools []json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &tools) != nil {
+		return false
+	}
+	for _, rawTool := range tools {
+		var tool struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(rawTool, &tool) == nil && tool.Type == "x_search" {
+			return true
+		}
+	}
+	return false
 }
 
 func rawArrayLength(raw json.RawMessage) int {

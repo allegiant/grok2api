@@ -3,15 +3,11 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"reflect"
 	"strings"
 )
 
 func normalizeResponsesTools(payload map[string]json.RawMessage) (*responsesToolCompatibility, error) {
-	if rawTools := payload["tools"]; len(rawTools) > 0 && strings.Contains(string(rawTools), "automation_update") {
-		slog.Info("DEBUG_RAW_AUTOMATION_TOOLS", "tools", string(rawTools))
-	}
 	compatibility := newResponsesToolCompatibility()
 	tools, hasTools, err := decodeOptionalArray(payload["tools"], "tools")
 	if err != nil {
@@ -70,9 +66,6 @@ func normalizeResponsesTools(payload map[string]json.RawMessage) (*responsesTool
 			compatibility.addWarning("parallel_tool_calls_without_tools_ignored")
 		}
 		compatibility.changed = true
-	}
-	if rawTools := payload["tools"]; len(rawTools) > 0 && strings.Contains(string(rawTools), "automation_update") {
-		slog.Info("DEBUG_NORMALIZED_AUTOMATION_TOOLS", "tools", string(rawTools))
 	}
 	if err := compatibility.normalizeToolChoice(payload, normalizedTools); err != nil {
 		return nil, err

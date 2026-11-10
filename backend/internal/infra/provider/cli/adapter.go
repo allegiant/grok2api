@@ -599,6 +599,7 @@ type responseCall struct {
 func (a *Adapter) doResponseRequest(ctx context.Context, request provider.ResponseResourceRequest, accessToken string, body []byte, base string) (call responseCall) {
 	if request.QualityDiagnostic != nil {
 		request.QualityDiagnostic.SetUpstreamRequest(provider.SummarizeRequestShape(body, request.Operation))
+		request.QualityDiagnostic.SetResponsesHistoryIntegrity(provider.CompareResponsesRequestHistory(request.Body, body, request.Operation))
 	}
 	startedAt := time.Now()
 	call = responseCall{upstreamURL: a.urlWithBase(base, request.Path), startedAt: startedAt.UTC()}

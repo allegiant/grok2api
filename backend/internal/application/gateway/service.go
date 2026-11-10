@@ -1658,8 +1658,10 @@ attemptLoop:
 					incomingShape := provider.RequestShapeSummary{}
 					upstreamShape := provider.RequestShapeSummary{}
 					rawUpstreamResponse := provider.RawResponsesStreamSummary{}
+					var historyIntegrity *provider.ResponsesHistoryIntegritySummary
 					if qualityDiagnostic != nil {
 						incomingShape, upstreamShape, rawUpstreamResponse = qualityDiagnostic.Snapshot()
+						historyIntegrity = qualityDiagnostic.ResponsesHistoryIntegritySnapshot()
 					}
 					s.logger.Info("quality_degraded_diagnostic",
 						"request_id", input.RequestID,
@@ -1668,6 +1670,7 @@ attemptLoop:
 						"protocol", qualityProtocolForOperation(operation),
 						"incoming_request_shape", marshalQualityDiagnosticJSON(incomingShape),
 						"upstream_request_shape", marshalQualityDiagnosticJSON(upstreamShape),
+						"responses_history_integrity", marshalQualityDiagnosticJSON(historyIntegrity),
 						"response_stream_shape", marshalQualityDiagnosticJSON(peekMetadata.Stream),
 						"raw_upstream_response_shape", marshalQualityDiagnosticJSON(rawUpstreamResponse),
 						"output_tokens", peekUsage.OutputTokens,
