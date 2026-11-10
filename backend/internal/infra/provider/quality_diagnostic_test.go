@@ -78,6 +78,32 @@ func TestObserveUpstreamResponsesPreservesBytesAndRedactsSummary(t *testing.T) {
 	}
 }
 
+func TestResetUpstreamAttemptPreservesIncomingAndClearsAttemptState(t *testing.T) {
+	incoming := SummarizeRequestShape([]byte(`{"input":"PRIVATE_PROMPT"}`), "responses")
+	diagnostic := &QualityRequestDiagnostic{}
+	diagnostic.SetIncomingRequest(incoming)
+	diagnostic.SetUpstreamRequest(incoming)
+	body := diagnostic.ObserveUpstreamResponses(io.NopCloser(strings.NewReader(`data: {"type":"response.created"}` + "\n\n")))
+	if _, err := io.Copy(io.Discard, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	diagnostic.ResetUpstreamAttempt()
+	gotIncoming, gotUpstream, raw := diagnostic.Snapshot()
+	if gotIncoming.PayloadBytes != incoming.PayloadBytes || gotIncoming.PayloadFormat != incoming.PayloadFormat {
+		t.Fatalf("incoming request was not preserved: %#v", gotIncoming)
+	}
+	if gotUpstream.PayloadBytes != 0 || gotUpstream.PayloadFormat != "" {
+		t.Fatalf("upstream request was not reset: %#v", gotUpstream)
+	}
+	if raw.EventCount != 0 || len(raw.Events) != 0 || raw.Terminal || raw.UsageReported {
+		t.Fatalf("raw response state was not reset: %#v", raw)
+	}
+}
+
 func TestRawResponsesSummaryBoundsEventTypeLists(t *testing.T) {
 	fixture := strings.Repeat("data: {\"type\":\"response.created\"}\n\n", maxRawResponsesTypes+5)
 	diagnostic := &QualityRequestDiagnostic{}

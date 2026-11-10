@@ -1057,6 +1057,9 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		started := time.Now()
 		responseStartedAt = started
 		lease.markSelectorUpstreamStarted()
+		if qualityDiagnostic != nil {
+			qualityDiagnostic.ResetUpstreamAttempt()
+		}
 		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, TransientRetry: transientRetry, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata, QualityDiagnostic: qualityDiagnostic})
 		auditBase.ReasoningEffort = normalizedMetadata.ReasoningEffort
 		err = failureAttempts.captureResponse(credential, started, response, err)

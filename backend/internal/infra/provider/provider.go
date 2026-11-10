@@ -413,6 +413,19 @@ func (d *QualityRequestDiagnostic) SetUpstreamRequest(shape RequestShapeSummary)
 	d.mu.Unlock()
 }
 
+// ResetUpstreamAttempt clears per-attempt observations while preserving the
+// original client request shape for the next account retry.
+func (d *QualityRequestDiagnostic) ResetUpstreamAttempt() {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.upstreamRequest = RequestShapeSummary{}
+	d.rawResponse = RawResponsesStreamSummary{}
+	d.rawEventBuffer = rawResponsesEventBuffer{}
+	d.mu.Unlock()
+}
+
 // Snapshot returns an immutable, content-free copy safe for structured logging.
 func (d *QualityRequestDiagnostic) Snapshot() (RequestShapeSummary, RequestShapeSummary, RawResponsesStreamSummary) {
 	if d == nil {
