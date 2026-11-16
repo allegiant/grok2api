@@ -807,8 +807,8 @@ func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) erro
 	if d := value.HoldTimeout.Value(); d != 0 && (d < 200*time.Millisecond || d > 30*time.Second) {
 		return errors.New("qualityGuard.requestRetry.holdTimeout 必须在 200ms 到 30s 之间")
 	}
-	if value.MinOutputTokens != 0 && (value.MinOutputTokens < 8 || value.MinOutputTokens > 256) {
-		return errors.New("qualityGuard.requestRetry.minOutputTokens 必须在 8 到 256 之间")
+	if value.MinOutputTokens != 0 && (value.MinOutputTokens < 1 || value.MinOutputTokens > 256) {
+		return errors.New("qualityGuard.requestRetry.minOutputTokens 必须在 1 到 256 之间")
 	}
 	switch strings.TrimSpace(value.OnExhausted) {
 	case "", "fail_open", "fail_closed":

@@ -238,13 +238,18 @@ func TestAutoDisableValidatesRequestPolicyWithoutSidecar(t *testing.T) {
 	if err := validateQualityGuardConfig(base); err != nil {
 		t.Fatalf("auto-disable with default policy: %v", err)
 	}
+	shortReplyFloor := base
+	shortReplyFloor.RequestRetry.MinOutputTokens = 4
+	if err := validateQualityGuardConfig(shortReplyFloor); err != nil {
+		t.Fatalf("4-token output floor should be valid: %v", err)
+	}
 	for _, test := range []struct {
 		name   string
 		change func(*QualityGuardConfig)
 	}{
 		{"retry limit", func(c *QualityGuardConfig) { c.RequestRetry.MaxAttempts = 7 }},
 		{"hold timeout", func(c *QualityGuardConfig) { c.RequestRetry.HoldTimeout = Duration(time.Minute) }},
-		{"output floor", func(c *QualityGuardConfig) { c.RequestRetry.MinOutputTokens = 1 }},
+		{"output floor below minimum", func(c *QualityGuardConfig) { c.RequestRetry.MinOutputTokens = -1 }},
 		{"soft TPS", func(c *QualityGuardConfig) { c.SoftTPS = 0 }},
 		{"hard TPS", func(c *QualityGuardConfig) { c.HardTPS = c.SoftTPS }},
 		{"generation window", func(c *QualityGuardConfig) { c.MinimumGenerationWindow = 0 }},

@@ -168,6 +168,8 @@ qualityGuard:
     enabled: false
     maxAttempts: 6
     holdTimeout: 30s
+    # Valid range: 1-256. Lower this (e.g. 4) to catch short zero-reasoning replies;
+    # low floors can also flag legitimate short answers.
     minOutputTokens: 8
     onExhausted: fail_closed # fail_open | fail_closed
     # Immediately disable an account on its first confirmed missing-thinking

@@ -490,6 +490,26 @@ func TestObserveQualityChunkShortNoThink(t *testing.T) {
 	}
 }
 
+func TestShortZeroReasoningReplyHonorsConfiguredOutputFloor(t *testing.T) {
+	t.Parallel()
+	state := qualityScanState{protocol: qualityProtocolChat}
+	ObserveQualityChunk(&state, []byte(sse(
+		`data: {"choices":[{"delta":{"content":"nope"}}]}`,
+		`data: {"usage":{"completion_tokens":4,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)))
+	sig := state.signals()
+	if sig.OutputTokens != 4 || sig.ReasoningTokens != 0 || !sig.Terminal {
+		t.Fatalf("unexpected short-reply signals: %#v", sig)
+	}
+	if got := ClassifyQualityHold(sig, 8); got != QualityDeliver {
+		t.Fatalf("4-token response should remain below the default 8-token floor, got %s", got)
+	}
+	if got := ClassifyQualityHold(sig, 4); got != QualityWithhold {
+		t.Fatalf("4-token zero-reasoning response should be withheld with a 4-token floor, got %s", got)
+	}
+}
+
 func TestObserveQualityChunkShortNoThinkIgnoresFakeReasoningUsage(t *testing.T) {
 	t.Parallel()
 	state := qualityScanState{protocol: qualityProtocolChat}
