@@ -1654,15 +1654,16 @@ attemptLoop:
 					hasNextAccount = selection != nil && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
 				}
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
+				incomingShape := provider.RequestShapeSummary{}
+				upstreamShape := provider.RequestShapeSummary{}
+				rawUpstreamResponse := provider.RawResponsesStreamSummary{}
+				var historyIntegrity *provider.ResponsesHistoryIntegritySummary
+				if qualityDiagnostic != nil {
+					incomingShape, upstreamShape, rawUpstreamResponse = qualityDiagnostic.Snapshot()
+					historyIntegrity = qualityDiagnostic.ResponsesHistoryIntegritySnapshot()
+				}
+				s.logQualityStreamObserved(input.RequestID, credential.ID, route, operation, verdict, commit.Action, qualityAccountAttempts, peekUsage, peekMetadata.Stream, incomingShape, upstreamShape, rawUpstreamResponse, historyIntegrity)
 				if verdict == QualityWithhold {
-					incomingShape := provider.RequestShapeSummary{}
-					upstreamShape := provider.RequestShapeSummary{}
-					rawUpstreamResponse := provider.RawResponsesStreamSummary{}
-					var historyIntegrity *provider.ResponsesHistoryIntegritySummary
-					if qualityDiagnostic != nil {
-						incomingShape, upstreamShape, rawUpstreamResponse = qualityDiagnostic.Snapshot()
-						historyIntegrity = qualityDiagnostic.ResponsesHistoryIntegritySnapshot()
-					}
 					s.logger.Info("quality_degraded_diagnostic",
 						"request_id", input.RequestID,
 						"account_id", credential.ID,
