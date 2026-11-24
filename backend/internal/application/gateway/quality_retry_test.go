@@ -2157,6 +2157,8 @@ func TestIsToolResultContinuationRequest(t *testing.T) {
 		{name: "responses function_call_output", body: `{"input":[{"role":"user","content":"hi"},{"type":"function_call","call_id":"c1","name":"ls","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"}]}`},
 		{name: "responses custom_tool_call_output", body: `{"input":[{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}]}`},
 		{name: "responses shell_call_output with trailing additional_tools", body: `{"input":[{"type":"shell_call_output","call_id":"c1","output":[]},{"type":"additional_tools","tools":[]}]}`},
+		{name: "responses function_call_output followed by grok build environment_context user block", body: `{"input":[{"type":"function_call_output","call_id":"c1","output":"ok"},{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/workspace</cwd>\n</environment_context>"}]}]}`},
+		{name: "responses function_call_output followed by system-reminder user block", body: `{"input":[{"type":"function_call_output","call_id":"c1","output":"ok"},{"type":"message","role":"user","content":"<system-reminder>hook ok</system-reminder>"}]}`},
 		{name: "chat role tool", body: `{"messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[]},{"role":"tool","tool_call_id":"c1","content":"ok"}]}`},
 		{name: "anthropic tool_result with system reminder", body: `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"},{"type":"text","text":"<system-reminder>info</system-reminder>"}]}]}`},
 	}
@@ -2172,6 +2174,7 @@ func TestIsToolResultContinuationRequest(t *testing.T) {
 	}{
 		{name: "responses string input", body: `{"input":"hello"}`},
 		{name: "responses first user message", body: `{"input":[{"role":"user","content":"hello"}]}`},
+		{name: "responses first user message with environment_context only", body: `{"input":[{"role":"user","content":"<environment_context>init</environment_context>"}]}`},
 		{name: "responses multi-turn ending with new user question", body: `{"input":[{"role":"user","content":"q1"},{"type":"function_call","call_id":"c1","name":"ls","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"},{"role":"user","content":"now explain"}]}`},
 		{name: "chat multi-turn ending with new user question", body: `{"messages":[{"role":"user","content":"q1"},{"role":"tool","content":"ok"},{"role":"user","content":"q2"}]}`},
 		{name: "anthropic plain user text blocks", body: `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`},
@@ -2180,6 +2183,15 @@ func TestIsToolResultContinuationRequest(t *testing.T) {
 		if isToolResultContinuationRequest([]byte(tc.body)) {
 			t.Fatalf("%s: expected false for %s", tc.name, tc.body)
 		}
+	}
+
+	withTools := inspectQualityRequestContinuation([]byte(`{"tools":[{"type":"function","name":"shell"}],"input":[{"type":"message","role":"user","content":"push"}]}`))
+	if withTools.IsToolContinuation || !withTools.HasToolLoopContext || withTools.TailItemType != "message" || withTools.TailItemRole != "user" {
+		t.Fatalf("unexpected continuation info for tool-enabled user turn: %+v", withTools)
+	}
+	plainChat := inspectQualityRequestContinuation([]byte(`{"messages":[{"role":"user","content":"write a game"}]}`))
+	if plainChat.IsToolContinuation || plainChat.HasToolLoopContext || plainChat.TailItemType != "message" || plainChat.TailItemRole != "user" {
+		t.Fatalf("unexpected continuation info for plain chat: %+v", plainChat)
 	}
 }
 
@@ -2480,6 +2492,111 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 			if acct.CooldownUntil == nil || acct.LastError != lastErrorMissingThinking {
 				t.Fatalf("stub-emitting degraded account %d must be cooled: %#v", cred.ID, acct)
 			}
+		}
+	})
+
+	t.Run("grok build cli environment_context after function_call_output uses two-account consensus", func(t *testing.T) {
+		ctx := context.Background()
+		responses := make(map[uint64][]scriptedBuildResponse)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-env-context.db", responses)
+		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
+		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
+		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
+
+		envTailBody := []byte(`{"model":"grok-4.7","stream":true,"tools":[{"type":"function","name":"shell"}],"input":[{"type":"message","role":"user","content":"check dir"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"},{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/app</cwd>\n</environment_context>"}]}]}`)
+		result, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-mt-env-tail", ClientKey: key, PublicModel: "grok-4.7",
+			Streaming: true, Body: envTailBody,
+		})
+		if err != nil {
+			t.Fatalf("expected 2-account consensus delivery, got err=%v", err)
+		}
+		body, _ := io.ReadAll(result.Body)
+		result.Finalize(Usage{Reported: true, OutputTokens: 26, ReasoningTokens: 0}, "resp-mt-clean", "")
+		_ = result.Body.Close()
+		if !strings.Contains(string(body), `"call_2"`) {
+			t.Fatalf("expected clean tool call delivered, got %s", body)
+		}
+		if attempts := adapter.Attempts(); len(attempts) != 2 {
+			t.Fatalf("expected 2 attempts for environment_context tail consensus, got %v", attempts)
+		}
+		for _, cred := range credentials[:2] {
+			acct, _ := accountRepo.Get(ctx, cred.ID)
+			if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
+				t.Fatalf("consensus account %d must not be cooled: %#v", cred.ID, acct)
+			}
+		}
+	})
+
+	t.Run("active tool session user confirmation reaches three-account consensus without mass cooldown", func(t *testing.T) {
+		ctx := context.Background()
+		responses := make(map[uint64][]scriptedBuildResponse)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-tool-session-3acct.db", responses)
+		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
+		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
+		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
+
+		userConfirmInToolSession := []byte(`{"model":"grok-4.7","stream":true,"tools":[{"type":"function","name":"shell"}],"input":[{"type":"message","role":"user","content":"fix bug"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"git status\"}"},{"type":"function_call_output","call_id":"call_1","output":"clean"},{"type":"message","role":"user","content":[{"type":"input_text","text":"推"}]}]}`)
+		result, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-mt-3acct", ClientKey: key, PublicModel: "grok-4.7",
+			Streaming: true, Body: userConfirmInToolSession,
+		})
+		if err != nil {
+			t.Fatalf("expected 3-account consensus delivery instead of 503 cascade, got err=%v", err)
+		}
+		body, _ := io.ReadAll(result.Body)
+		result.Finalize(Usage{Reported: true, OutputTokens: 26, ReasoningTokens: 0}, "resp-mt-clean", "")
+		_ = result.Body.Close()
+		if !strings.Contains(string(body), `"call_2"`) {
+			t.Fatalf("expected 3rd account clean tool call delivered, got %s", body)
+		}
+		if attempts := adapter.Attempts(); len(attempts) != 3 {
+			t.Fatalf("expected 3 attempts for user-tail tool-session consensus, got %v", attempts)
+		}
+		for _, cred := range credentials {
+			acct, _ := accountRepo.Get(ctx, cred.ID)
+			if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
+				t.Fatalf("account %d must not be mass-cooled when 3 independent accounts agree on 0-reasoning: %#v", cred.ID, acct)
+			}
+		}
+	})
+
+	t.Run("failed quota probe does not steal quality retry attempt budget", func(t *testing.T) {
+		ctx := context.Background()
+		responses := make(map[uint64][]scriptedBuildResponse)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-quota-probe-budget.db", responses)
+		service.UpdateQualityRetry(QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
+			OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
+		})
+		now := time.Now().UTC()
+		due := now.Add(-time.Minute)
+		if err := accountRepo.SaveQuotaRecovery(ctx, accountdomain.QuotaRecovery{
+			AccountID: credentials[0].ID, Kind: accountdomain.QuotaRecoveryKindFree,
+			Status: accountdomain.QuotaRecoveryStatusExhausted, NextProbeAt: &due, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// credentials[0] is a due QuotaProbe that fails with 429; credentials[1] & [2] are normal accounts.
+		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusTooManyRequests, body: `{"error":"Free tier limit reached: 10/10"}`}}
+		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
+		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
+
+		result, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-mt-probe", ClientKey: key, PublicModel: "grok-4.7",
+			Streaming: true, Body: toolContinuationBody,
+		})
+		if err != nil {
+			t.Fatalf("failed quota probe must not exhaust MaxAttempts=2 before 2nd normal account delivers: %v", err)
+		}
+		body, _ := io.ReadAll(result.Body)
+		result.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
+		_ = result.Body.Close()
+		if !strings.Contains(string(body), validCipher) {
+			t.Fatalf("expected thinking response from credentials[2], got %s", body)
+		}
+		if attempts := adapter.Attempts(); len(attempts) != 3 {
+			t.Fatalf("expected 1 quota probe + 2 normal attempts, got %v", attempts)
 		}
 	})
 }

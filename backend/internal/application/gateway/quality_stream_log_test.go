@@ -33,9 +33,9 @@ func TestLogQualityStreamObservedIncludesDeliver(t *testing.T) {
 		ToolCallReferencesMatch: true, IncomingReasoningItems: 4, UpstreamReasoningItems: 4,
 		IncomingEncryptedReasoningItems: 4, UpstreamEncryptedReasoningItems: 4, XSearchInjected: true,
 	}
-	service.logQualityStreamObserved("req-1", 7, modeldomain.Route{PublicID: "grok", UpstreamModel: "grok-4", Provider: accountdomain.ProviderBuild}, audit.OperationMessages, QualityDeliver, QualityActionDeliver, 1, Usage{OutputTokens: 12, ReasoningTokens: 30}, qualityStreamDiagnostic{HasThinking: true, UsageReported: true}, provider.RequestShapeSummary{ThinkingType: "adaptive"}, provider.RequestShapeSummary{ReasoningEffort: "xhigh", XSearchToolPresent: true}, provider.RawResponsesStreamSummary{ReasoningItemEvents: 1, ReasoningTokens: 30, Terminal: true, UsageReported: true}, history)
+	service.logQualityStreamObserved("req-1", 7, modeldomain.Route{PublicID: "grok", UpstreamModel: "grok-4", Provider: accountdomain.ProviderBuild}, audit.OperationMessages, QualityDeliver, QualityActionDeliver, 1, Usage{OutputTokens: 12, ReasoningTokens: 30}, qualityStreamDiagnostic{HasThinking: true, UsageReported: true}, provider.RequestShapeSummary{ThinkingType: "adaptive"}, provider.RequestShapeSummary{ReasoningEffort: "xhigh", XSearchToolPresent: true}, provider.RawResponsesStreamSummary{ReasoningItemEvents: 1, ReasoningTokens: 30, Terminal: true, UsageReported: true}, history, qualityRequestContinuationInfo{TailItemType: "tool_result", TailItemRole: "user", IsToolContinuation: true, HasToolLoopContext: true})
 	line := buf.String()
-	for _, want := range []string{`"msg":"quality_stream_observed"`, `"verdict":"deliver"`, `"reasoning_tokens":30`, `"history_encrypted_match":true`, `"raw_reasoning_items":1`, `"incoming_thinking_type":"adaptive"`} {
+	for _, want := range []string{`"msg":"quality_stream_observed"`, `"verdict":"deliver"`, `"reasoning_tokens":30`, `"history_encrypted_match":true`, `"raw_reasoning_items":1`, `"incoming_thinking_type":"adaptive"`, `"tail_item_type":"tool_result"`, `"tool_continuation":true`} {
 		if !bytes.Contains([]byte(line), []byte(want)) {
 			t.Fatalf("log missing %s: %s", want, line)
 		}

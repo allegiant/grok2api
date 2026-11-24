@@ -55,6 +55,7 @@ func (s *Service) logQualityStreamObserved(
 	incoming, upstream provider.RequestShapeSummary,
 	raw provider.RawResponsesStreamSummary,
 	history *provider.ResponsesHistoryIntegritySummary,
+	continuation qualityRequestContinuationInfo,
 ) {
 	if s == nil || s.logger == nil {
 		return
@@ -100,6 +101,10 @@ func (s *Service) logQualityStreamObserved(
 		"encrypted_content_valid", stream.EncryptedContentValid,
 		"usage_reported", stream.UsageReported,
 		"terminal", stream.Terminal,
+		"tail_item_type", continuation.TailItemType,
+		"tail_item_role", continuation.TailItemRole,
+		"tool_continuation", continuation.IsToolContinuation,
+		"tool_loop_context", continuation.HasToolLoopContext,
 		"incoming_items", incomingSignals.items,
 		"incoming_reasoning_items", incomingSignals.reasoning,
 		"incoming_encrypted_reasoning_items", incomingSignals.encrypted,

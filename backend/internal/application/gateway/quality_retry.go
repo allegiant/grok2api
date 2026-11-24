@@ -638,71 +638,241 @@ func jsonStringEquals(raw json.RawMessage, want string) bool {
 	return json.Unmarshal(raw, &value) == nil && strings.EqualFold(strings.TrimSpace(value), want)
 }
 
+type qualityRequestContinuationInfo struct {
+	TailItemType       string
+	TailItemRole       string
+	IsToolContinuation bool
+	HasToolLoopContext bool
+}
+
 // isToolResultContinuationRequest reports whether the active turn is feeding
 // tool execution output back into an in-flight tool loop rather than starting
-// a new user prompt. Only the trailing effective input item is inspected so a
-// multi-turn chat ending with a fresh user question still requires thinking.
+// a new user prompt. Harness-injected XML context wrappers (such as
+// <environment_context> or <system-reminder>) immediately following a tool
+// output are treated as part of the tool continuation; genuine user prompts
+// are not.
 func isToolResultContinuationRequest(body []byte) bool {
+	return inspectQualityRequestContinuation(body).IsToolContinuation
+}
+
+func inspectQualityRequestContinuation(body []byte) qualityRequestContinuationInfo {
+	var info qualityRequestContinuationInfo
 	if len(body) == 0 {
-		return false
+		return info
 	}
 	var payload map[string]json.RawMessage
 	if json.Unmarshal(body, &payload) != nil || payload == nil {
-		return false
+		return info
+	}
+	if rawTools, ok := payload["tools"]; ok && len(rawTools) > 0 {
+		var tools []json.RawMessage
+		if json.Unmarshal(rawTools, &tools) == nil && len(tools) > 0 {
+			info.HasToolLoopContext = true
+		}
 	}
 	if rawInput, ok := payload["input"]; ok {
 		var items []json.RawMessage
-		if json.Unmarshal(rawInput, &items) == nil && len(items) > 0 {
-			for index := len(items) - 1; index >= 0; index-- {
-				var item struct {
-					Type string `json:"type"`
-					Role string `json:"role"`
-				}
-				if json.Unmarshal(items[index], &item) != nil {
-					return false
-				}
-				itemType := strings.ToLower(strings.TrimSpace(item.Type))
-				if itemType == "additional_tools" {
-					continue
-				}
-				if isToolResultItemType(itemType) {
-					return true
-				}
-				role := strings.ToLower(strings.TrimSpace(item.Role))
-				return role == "tool" || role == "function"
+		if json.Unmarshal(rawInput, &items) == nil {
+			if len(items) == 0 {
+				return info
 			}
-		}
-		return false
-	}
-	if rawMessages, ok := payload["messages"]; ok {
-		var messages []json.RawMessage
-		if json.Unmarshal(rawMessages, &messages) == nil && len(messages) > 0 {
-			var last struct {
+			type parsedInputItem struct {
+				Type    string          `json:"type"`
 				Role    string          `json:"role"`
 				Content json.RawMessage `json:"content"`
 			}
-			if json.Unmarshal(messages[len(messages)-1], &last) != nil {
-				return false
+			parsed := make([]parsedInputItem, len(items))
+			for idx, rawItem := range items {
+				if json.Unmarshal(rawItem, &parsed[idx]) != nil {
+					return info
+				}
+				t := strings.ToLower(strings.TrimSpace(parsed[idx].Type))
+				r := strings.ToLower(strings.TrimSpace(parsed[idx].Role))
+				if isToolResultItemType(t) || isToolCallItemType(t) || r == "tool" || r == "function" {
+					info.HasToolLoopContext = true
+				}
 			}
+			tailCaptured := false
+			for index := len(parsed) - 1; index >= 0; index-- {
+				itemType := strings.ToLower(strings.TrimSpace(parsed[index].Type))
+				role := strings.ToLower(strings.TrimSpace(parsed[index].Role))
+				if itemType == "additional_tools" {
+					continue
+				}
+				if !tailCaptured {
+					info.TailItemType = safeQualityTailItemType(itemType)
+					info.TailItemRole = safeQualityTailItemRole(role)
+					tailCaptured = true
+				}
+				if isToolResultItemType(itemType) || role == "tool" || role == "function" {
+					info.IsToolContinuation = true
+					return info
+				}
+				if role == "developer" || role == "system" || (role == "user" && isHarnessInjectedReminderContent(parsed[index].Content)) {
+					continue
+				}
+				return info
+			}
+			return info
+		}
+		var scalar string
+		if json.Unmarshal(rawInput, &scalar) == nil {
+			info.TailItemType = "text_input"
+			info.TailItemRole = "user"
+		}
+		return info
+	}
+	if rawMessages, ok := payload["messages"]; ok {
+		var messages []json.RawMessage
+		if json.Unmarshal(rawMessages, &messages) != nil || len(messages) == 0 {
+			return info
+		}
+		type parsedMessage struct {
+			Role         string          `json:"role"`
+			Content      json.RawMessage `json:"content"`
+			ToolCalls    []any           `json:"tool_calls"`
+			FunctionCall any             `json:"function_call"`
+		}
+		parsed := make([]parsedMessage, len(messages))
+		for idx, rawMsg := range messages {
+			if json.Unmarshal(rawMsg, &parsed[idx]) != nil {
+				return info
+			}
+			r := strings.ToLower(strings.TrimSpace(parsed[idx].Role))
+			if r == "tool" || r == "function" || len(parsed[idx].ToolCalls) > 0 || parsed[idx].FunctionCall != nil || messageBlocksContainToolItem(parsed[idx].Content) {
+				info.HasToolLoopContext = true
+			}
+		}
+		tailCaptured := false
+		for index := len(parsed) - 1; index >= 0; index-- {
+			last := parsed[index]
 			role := strings.ToLower(strings.TrimSpace(last.Role))
-			if role == "tool" || role == "function" {
-				return true
-			}
-			if role == "user" && len(last.Content) > 0 {
-				var blocks []struct {
-					Type string `json:"type"`
+			hasToolResultBlock := role == "user" && messageBlocksHaveToolResult(last.Content)
+			if !tailCaptured {
+				if hasToolResultBlock {
+					info.TailItemType = "tool_result"
+				} else if role == "tool" || role == "function" {
+					info.TailItemType = "tool_result"
+				} else {
+					info.TailItemType = "message"
 				}
-				if json.Unmarshal(last.Content, &blocks) == nil {
-					for _, block := range blocks {
-						if strings.EqualFold(strings.TrimSpace(block.Type), "tool_result") {
-							return true
-						}
-					}
-				}
+				info.TailItemRole = safeQualityTailItemRole(role)
+				tailCaptured = true
 			}
+			if role == "tool" || role == "function" || hasToolResultBlock {
+				info.IsToolContinuation = true
+				return info
+			}
+			if role == "developer" || role == "system" || (role == "user" && isHarnessInjectedReminderContent(last.Content)) {
+				continue
+			}
+			return info
+		}
+	}
+	return info
+}
+
+func messageBlocksHaveToolResult(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return false
+	}
+	for _, block := range blocks {
+		if strings.EqualFold(strings.TrimSpace(block.Type), "tool_result") {
+			return true
 		}
 	}
 	return false
+}
+
+func messageBlocksContainToolItem(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return false
+	}
+	for _, block := range blocks {
+		t := strings.ToLower(strings.TrimSpace(block.Type))
+		if t == "tool_result" || t == "tool_use" {
+			return true
+		}
+	}
+	return false
+}
+
+func isHarnessInjectedReminderContent(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return isHarnessInjectedReminderText(text)
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil || len(blocks) == 0 {
+		return false
+	}
+	matched := false
+	for _, block := range blocks {
+		t := strings.ToLower(strings.TrimSpace(block.Type))
+		if t != "" && t != "text" && t != "input_text" {
+			return false
+		}
+		if strings.TrimSpace(block.Text) == "" {
+			continue
+		}
+		if !isHarnessInjectedReminderText(block.Text) {
+			return false
+		}
+		matched = true
+	}
+	return matched
+}
+
+func isHarnessInjectedReminderText(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) < 4 || !strings.HasPrefix(trimmed, "<") || !strings.HasSuffix(trimmed, ">") {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	for _, prefix := range []string{
+		"<system-reminder>",
+		"<system-reminder ",
+		"<environment_context>",
+		"<environment_context ",
+		"<turn_aborted>",
+		"<turn_aborted ",
+		"<collaboration_mode>",
+		"<collaboration_mode ",
+		"<permissions instructions>",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isToolCallItemType(itemType string) bool {
+	switch itemType {
+	case "function_call", "custom_tool_call", "computer_call", "shell_call",
+		"local_shell_call", "apply_patch_call", "mcp_call", "tool_search_call", "web_search_call":
+		return true
+	default:
+		return false
+	}
 }
 
 func isToolResultItemType(itemType string) bool {
@@ -713,6 +883,32 @@ func isToolResultItemType(itemType string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func safeQualityTailItemType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return ""
+	case "message", "text_input", "reasoning", "function_call", "function_call_output",
+		"custom_tool_call", "custom_tool_call_output", "computer_call", "computer_call_output",
+		"shell_call", "shell_call_output", "local_shell_call", "local_shell_call_output",
+		"apply_patch_call", "apply_patch_call_output", "mcp_call", "mcp_call_output",
+		"mcp_tool_call_output", "tool_search_call", "tool_search_output", "tool_result", "tool_use":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "other"
+	}
+}
+
+func safeQualityTailItemRole(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return ""
+	case "user", "assistant", "system", "developer", "tool", "function":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "other"
 	}
 }
 
