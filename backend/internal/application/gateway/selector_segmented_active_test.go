@@ -37,7 +37,7 @@ func TestSegmentedCandidateCohortsRetainOnlyBoundedRotatingWindows(t *testing.T)
 			ID: uint64(index + 1), Provider: account.ProviderBuild, Priority: account.DefaultPriority,
 		}}
 	}
-	buckets := segmentedCandidateCohorts(values, nil, time.Now().UTC(), nil, false, 9980, 64, segmentedWindowsBeforeFullFallback)
+	buckets := segmentedCandidateCohorts(values, nil, time.Now().UTC(), nil, false, nil, 9980, 64, segmentedWindowsBeforeFullFallback)
 	if len(buckets) != 1 || len(buckets[0].indexes) != 256 {
 		t.Fatalf("bounded cohorts = %#v", buckets)
 	}
@@ -218,7 +218,7 @@ func TestSegmentedActiveExhaustsHigherPriorityCohortBeforeFallingBack(t *testing
 }
 
 func TestSegmentedActiveCohortOrderingMatchesFullPlannerHardOrder(t *testing.T) {
-	cohorts := make([]segmentedSelectorCohort, 0, 64)
+	cohorts := make([]segmentedSelectorCohort, 0, 128)
 	for _, supportsModel := range []bool{false, true} {
 		for _, capabilityKnown := range []bool{false, true} {
 			for _, quotaKnown := range []bool{false, true} {
@@ -226,13 +226,15 @@ func TestSegmentedActiveCohortOrderingMatchesFullPlannerHardOrder(t *testing.T) 
 					for _, preferFreeBuild := range []bool{false, true} {
 						for _, tier := range []int{0, 2} {
 							for _, priority := range []int{1, 10} {
-								for _, billingFresh := range []bool{false, true} {
-									cohorts = append(cohorts, segmentedSelectorCohort{
-										supportsModel: supportsModel, capabilityKnown: capabilityKnown,
-										quotaKnown: quotaKnown, quotaAvailable: quotaAvailable,
-										preferFreeBuild: preferFreeBuild, tier: tier, priority: priority,
-										billingFresh: billingFresh,
-									})
+								for _, verifiedThinking := range []bool{false, true} {
+									for _, billingFresh := range []bool{false, true} {
+										cohorts = append(cohorts, segmentedSelectorCohort{
+											supportsModel: supportsModel, capabilityKnown: capabilityKnown,
+											quotaKnown: quotaKnown, quotaAvailable: quotaAvailable,
+											preferFreeBuild: preferFreeBuild, tier: tier, priority: priority,
+											verifiedThinking: verifiedThinking, billingFresh: billingFresh,
+										})
+									}
 								}
 							}
 						}
@@ -251,8 +253,8 @@ func TestSegmentedActiveCohortOrderingMatchesFullPlannerHardOrder(t *testing.T) 
 				{Credential: account.Credential{ID: 2, Priority: right.priority}, SupportsModel: right.supportsModel, ModelCapabilityKnown: right.capabilityKnown},
 			}
 			scores := []candidateScore{
-				{index: 0, tier: left.tier, quotaKnown: left.quotaKnown, quotaAvailable: left.quotaAvailable, preferFreeBuild: left.preferFreeBuild, billingFresh: left.billingFresh},
-				{index: 1, tier: right.tier, quotaKnown: right.quotaKnown, quotaAvailable: right.quotaAvailable, preferFreeBuild: right.preferFreeBuild, billingFresh: right.billingFresh},
+				{index: 0, tier: left.tier, quotaKnown: left.quotaKnown, quotaAvailable: left.quotaAvailable, preferFreeBuild: left.preferFreeBuild, verifiedThinking: left.verifiedThinking, billingFresh: left.billingFresh},
+				{index: 1, tier: right.tier, quotaKnown: right.quotaKnown, quotaAvailable: right.quotaAvailable, preferFreeBuild: right.preferFreeBuild, verifiedThinking: right.verifiedThinking, billingFresh: right.billingFresh},
 			}
 			if got, want := segmentedSelectorCohortBetter(left, right), candidateScoreBetter(values, scores[0], scores[1]); got != want {
 				t.Fatalf("cohort order mismatch at %d/%d: got %t want %t", leftIndex, rightIndex, got, want)
@@ -276,7 +278,7 @@ func TestSegmentedCohortsUseEffectiveWebCatalogCapability(t *testing.T) {
 	}
 	cohorts := segmentedCandidateCohorts(values, nil, time.Now().UTC(), []account.WebTier{
 		account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy,
-	}, false, 0, 1, 2)
+	}, false, nil, 0, 1, 2)
 	if len(cohorts) != 2 || len(cohorts[0].indexes) != 1 || cohorts[0].indexes[0] != 0 {
 		t.Fatalf("segmented Web cohorts = %#v, want Basic account first", cohorts)
 	}

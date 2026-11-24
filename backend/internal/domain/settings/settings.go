@@ -150,6 +150,9 @@ type AccountsConfig struct {
 	// AutoDisableDegradedAccounts is optional so legacy persisted settings keep
 	// the qualityGuard.requestRetry.autoDisable value supplied by config.yaml.
 	AutoDisableDegradedAccounts *bool
+	// QualityRetryMaxAttempts is optional so legacy persisted settings keep
+	// the qualityGuard.requestRetry.maxAttempts value supplied by config.yaml.
+	QualityRetryMaxAttempts *int
 	// MarkBuildForbiddenReauth marks high-confidence Grok Build permission denials as requiring reauthorization.
 	MarkBuildForbiddenReauth bool
 	// BuildForbiddenReauthCodes contains exact upstream error codes that opt into account invalidation.

@@ -166,6 +166,7 @@ qualityGuard:
   # is max(minEncryptedBytes, reasoning_tokens * encryptedBytesPerReasoningToken).
   requestRetry:
     enabled: false
+    # Valid range: 1-100. Also bounded by routing.maxAttempts.
     maxAttempts: 6
     holdTimeout: 30s
     # Valid range: 1-256. Lower this (e.g. 4) to catch short zero-reasoning replies;

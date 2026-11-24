@@ -48,8 +48,8 @@ type qualityStreamDiagnostic struct {
 }
 
 type qualityPeekMetadata struct {
-	Stream                         qualityStreamDiagnostic
-	CleanZeroReasoningContinuation bool
+	Stream        qualityStreamDiagnostic
+	FirstOutputAt time.Time
 }
 
 type qualityScanState struct {
@@ -69,8 +69,15 @@ type qualityScanState struct {
 	usage                           Usage
 	terminal                        bool
 	holdExpired                     bool
+	firstOutputAt                   time.Time
 	firstVisibleAt                  time.Time
 	diagnostic                      qualityStreamDiagnostic
+}
+
+func noteFirstOutput(state *qualityScanState) {
+	if state != nil && state.firstOutputAt.IsZero() {
+		state.firstOutputAt = time.Now()
+	}
 }
 
 func (s *qualityScanState) addDiagnosticEvent(value string) {
@@ -164,16 +171,6 @@ func marshalQualityDiagnosticJSON(value any) string {
 	return string(data)
 }
 
-func (s *qualityScanState) isCleanZeroReasoningContinuation(sig QualityStreamSignals) bool {
-	if s == nil {
-		return false
-	}
-	if s.hasThinking || s.reasoningStarted || s.encryptedBytes > 0 || sig.ReasoningTokens > 0 {
-		return false
-	}
-	return s.semanticOutput || sig.VisibleTokens > 0 || sig.OutputTokens > 0
-}
-
 func (s *qualityScanState) peekMetadata() qualityPeekMetadata {
 	if s == nil {
 		return qualityPeekMetadata{}
@@ -187,8 +184,8 @@ func (s *qualityScanState) peekMetadata() qualityPeekMetadata {
 	stream.EncryptedContentValid = s.validEncryptedContent
 	stream.UsageReported = s.usage.Reported
 	return qualityPeekMetadata{
-		Stream:                         stream,
-		CleanZeroReasoningContinuation: s.isCleanZeroReasoningContinuation(sig),
+		Stream:        stream,
+		FirstOutputAt: s.firstOutputAt,
 	}
 }
 
@@ -364,6 +361,7 @@ func ObserveQualityChunk(state *qualityScanState, chunk []byte) {
 		if bytes.Equal(line, []byte(qualityReasoningDeltaSSEComment)) {
 			state.reasoningStarted = true
 			state.hasThinking = true
+			noteFirstOutput(state)
 			continue
 		}
 		if bytes.HasPrefix(line, []byte(qualityReasoningEvidenceSSEComment)) {
@@ -375,6 +373,9 @@ func ObserveQualityChunk(state *qualityScanState, chunk []byte) {
 			if len(fields) > 0 {
 				if count, err := strconv.Atoi(fields[0]); err == nil && count > state.encryptedBytes {
 					state.encryptedBytes = count
+					if count > 0 {
+						noteFirstOutput(state)
+					}
 				}
 				for _, flag := range fields[1:] {
 					if strings.EqualFold(flag, "valid") {
@@ -449,6 +450,7 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 		delta := choice.Delta
 		if strings.TrimSpace(delta.Reasoning) != "" || strings.TrimSpace(delta.ReasoningContent) != "" || strings.TrimSpace(delta.ThinkingContent) != "" {
 			state.hasThinking = true
+			noteFirstOutput(state)
 			state.addDiagnosticOutputItem("thinking")
 		}
 		if delta.Content != "" {
@@ -457,6 +459,7 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 		}
 		if len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
 			state.semanticOutput = true
+			noteFirstOutput(state)
 			state.addDiagnosticOutputItem("tool_call")
 		}
 		if choice.FinishReason != "" {
@@ -565,6 +568,9 @@ func noteEncryptedBytes(state *qualityScanState, blob string) {
 	trimmed := strings.TrimSpace(blob)
 	if n := len(trimmed); n > state.encryptedBytes {
 		state.encryptedBytes = n
+		if n > 0 {
+			noteFirstOutput(state)
+		}
 	}
 	if isValidGrokEncryptedContent(trimmed) {
 		state.validEncryptedContent = true
@@ -632,6 +638,7 @@ func noteResponsesReasoningItem(state *qualityScanState, item qualityResponsesOu
 	}
 	if responsesReasoningPartsHaveText(item.Summary) || responsesReasoningPartsHaveText(item.Content) {
 		state.hasThinking = true
+		noteFirstOutput(state)
 	}
 	noteEncryptedBytes(state, item.EncryptedContent)
 }
@@ -699,15 +706,18 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 		state.addDiagnosticContentBlock("reasoning")
 		if strings.TrimSpace(deltaText) != "" {
 			state.hasThinking = true
+			noteFirstOutput(state)
 		}
 	case "response.reasoning_text.done", "response.reasoning_summary_text.done":
 		state.addDiagnosticContentBlock("reasoning")
 		if strings.TrimSpace(event.Text) != "" || strings.TrimSpace(deltaText) != "" {
 			state.hasThinking = true
+			noteFirstOutput(state)
 		}
 	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
 		if responsesReasoningPartsHaveText(event.Part) {
 			state.hasThinking = true
+			noteFirstOutput(state)
 		}
 	case "response.output_item.added", "response.output_item.done":
 		var item qualityResponsesOutputItem
@@ -724,6 +734,7 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.mcp_call_arguments.delta":
 		if deltaText != "" {
 			state.semanticOutput = true
+			noteFirstOutput(state)
 		}
 		switch event.Type {
 		case "response.function_call_arguments.delta":
@@ -772,6 +783,7 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 			if plainText != "" {
 				visibleRunes += utf8.RuneCountInString(plainText)
 				state.semanticOutput = true
+				noteFirstOutput(state)
 			}
 			return visibleRunes
 		}
@@ -789,10 +801,12 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 				if text != "" {
 					visibleRunes += utf8.RuneCountInString(text)
 					state.semanticOutput = true
+					noteFirstOutput(state)
 					continue
 				}
 				if content.Type != "" && content.Type != "output_text" && content.Type != "refusal" {
 					state.semanticOutput = true
+					noteFirstOutput(state)
 				}
 			}
 		}
@@ -800,6 +814,7 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 		// Function, shell, MCP and other call items are meaningful output even
 		// when the provider omits usage and argument-delta events.
 		state.semanticOutput = true
+		noteFirstOutput(state)
 	}
 	return visibleRunes
 }
@@ -851,11 +866,13 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 		case "":
 		default:
 			state.semanticOutput = true
+			noteFirstOutput(state)
 		}
 	case "content_block_delta":
 		state.addDiagnosticDelta(event.Delta.Type)
 		if event.Delta.Type == "thinking_delta" && strings.TrimSpace(event.Delta.Thinking) != "" {
 			state.hasThinking = true
+			noteFirstOutput(state)
 		}
 		if event.Delta.Type == "signature_delta" && strings.TrimSpace(event.Delta.Signature) != "" {
 			// Anthropic Messages represents Responses encrypted_content as a
@@ -868,6 +885,7 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 		}
 		if event.Delta.Type == "input_json_delta" && event.Delta.PartialJSON != "" {
 			state.semanticOutput = true
+			noteFirstOutput(state)
 		}
 	}
 	if event.Usage != nil {
@@ -883,6 +901,7 @@ func noteVisibleContent(state *qualityScanState, text string) {
 	if text == "" {
 		return
 	}
+	noteFirstOutput(state)
 	if state.firstVisibleAt.IsZero() {
 		state.firstVisibleAt = time.Now()
 	}

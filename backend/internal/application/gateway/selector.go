@@ -35,6 +35,7 @@ type accountLease struct {
 
 const quotaProbeLease = 5 * time.Minute
 const successPersistInterval = 30 * time.Second
+const verifiedThinkingTTL = 6 * time.Hour
 
 // Routing writes publish precise invalidation events, so the TTL is only a
 // safety net for out-of-process database changes and missed notifications.
@@ -365,6 +366,7 @@ type Selector struct {
 	leaseWake              chan struct{}
 	lastSelectedAt         map[uint64]time.Time
 	lastSuccessAt          map[uint64]time.Time
+	verifiedThinkingAt     map[uint64]time.Time
 	healthOverrides        map[uint64]routingHealthOverride
 	quotaConsumed          map[quotaConsumptionKey]int
 	staleFallbackLoggedAt  map[string]time.Time
@@ -390,7 +392,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), healthOverrides: make(map[uint64]routingHealthOverride), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), verifiedThinkingAt: make(map[uint64]time.Time), healthOverrides: make(map[uint64]routingHealthOverride), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 // SetLogger wires the application logger into routing degradation diagnostics.
@@ -1027,6 +1029,62 @@ func (s *Selector) MarkSuccess(ctx context.Context, credential account.Credentia
 	s.markSuccess(ctx, credential, true)
 }
 
+// MarkVerifiedThinking records that an account produced a real thinking stream
+// on Grok Build so idle scheduling prefers proven-thinking accounts over
+// untested batches.
+func (s *Selector) MarkVerifiedThinking(accountID uint64) {
+	if s == nil || accountID == 0 {
+		return
+	}
+	s.selectionMu.Lock()
+	if s.verifiedThinkingAt == nil {
+		s.verifiedThinkingAt = make(map[uint64]time.Time)
+	}
+	s.verifiedThinkingAt[accountID] = time.Now().UTC()
+	s.selectionMu.Unlock()
+}
+
+func (s *Selector) clearVerifiedThinking(accountID uint64) {
+	if s == nil || accountID == 0 {
+		return
+	}
+	s.selectionMu.Lock()
+	delete(s.verifiedThinkingAt, accountID)
+	s.selectionMu.Unlock()
+}
+
+func (s *Selector) hasVerifiedThinkingLocked(accountID uint64, now time.Time) bool {
+	if s == nil || accountID == 0 || len(s.verifiedThinkingAt) == 0 {
+		return false
+	}
+	verifiedAt, ok := s.verifiedThinkingAt[accountID]
+	if !ok || verifiedAt.IsZero() {
+		return false
+	}
+	return now.Sub(verifiedAt) <= verifiedThinkingTTL
+}
+
+func (s *Selector) verifiedThinkingSnapshot(provider account.Provider, now time.Time) map[uint64]bool {
+	if s == nil || provider != account.ProviderBuild {
+		return nil
+	}
+	s.selectionMu.RLock()
+	defer s.selectionMu.RUnlock()
+	if len(s.verifiedThinkingAt) == 0 {
+		return nil
+	}
+	var snapshot map[uint64]bool
+	for accountID, verifiedAt := range s.verifiedThinkingAt {
+		if !verifiedAt.IsZero() && now.Sub(verifiedAt) <= verifiedThinkingTTL {
+			if snapshot == nil {
+				snapshot = make(map[uint64]bool, len(s.verifiedThinkingAt))
+			}
+			snapshot[accountID] = true
+		}
+	}
+	return snapshot
+}
+
 func isMissingThinkingStrike(lastError string) bool {
 	return lastError == lastErrorMissingThinking || lastError == lastErrorMissingThinkingDisabled
 }
@@ -1081,6 +1139,7 @@ func (s *Selector) MarkFreeQuotaExhausted(ctx context.Context, credential accoun
 }
 
 func (s *Selector) markFreeQuotaExhaustedAt(ctx context.Context, credential account.Credential, used, limit int64, now, nextProbeAt time.Time) error {
+	s.clearVerifiedThinking(credential.ID)
 	if err := s.accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
 		AccountID: credential.ID, Kind: account.QuotaRecoveryKindFree, Status: account.QuotaRecoveryStatusExhausted,
 		ConfirmedUsed: used, ConfirmedLimit: limit, ExhaustedAt: &now,
@@ -1094,6 +1153,7 @@ func (s *Selector) markFreeQuotaExhaustedAt(ctx context.Context, credential acco
 }
 
 func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential account.Credential, billing *account.Billing, upstreamModel string, retryAfter time.Duration) {
+	s.clearVerifiedThinking(credential.ID)
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		s.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
@@ -1116,6 +1176,7 @@ func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential accou
 // Build OAuth accounts may still have valid video access when a chat endpoint
 // returns 403, so a model denial must not invalidate the whole credential.
 func (s *Selector) MarkModelAccessDenied(ctx context.Context, credential account.Credential, upstreamModel string, retryAfter time.Duration) error {
+	s.clearVerifiedThinking(credential.ID)
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		return nil
@@ -1138,6 +1199,7 @@ func (s *Selector) MarkModelAccessDenied(ctx context.Context, credential account
 // Paid accounts follow their upstream billing period; Free or unknown accounts
 // use the fixed local recovery window.
 func (s *Selector) MarkPaymentQuotaExhausted(ctx context.Context, credential account.Credential, hints quotaRecoveryHints) error {
+	s.clearVerifiedThinking(credential.ID)
 	now := time.Now().UTC()
 	if hints.Billing != nil && hints.Billing.IsPaid() {
 		if periodEnd, ok := hints.Billing.PeriodEnd(); ok && periodEnd.After(now) {
@@ -1235,6 +1297,7 @@ func (s *Selector) clearQuotaConsumptionAccount(provider account.Provider, accou
 // markMissingThinking disables immediately when configured; otherwise it
 // cools the first no-thinking hit and disables a later hit after the cooldown.
 func (s *Selector) markMissingThinking(ctx context.Context, credential account.Credential, cooldown time.Duration, autoDisable bool) (missingThinkingPenaltyResult, error) {
+	s.clearVerifiedThinking(credential.ID)
 	if cooldown <= 0 {
 		cooldown = defaultMissingThinkingCooldown
 	}
@@ -1266,6 +1329,7 @@ func (s *Selector) markMissingThinking(ctx context.Context, credential account.C
 }
 
 func (s *Selector) disableAccount(ctx context.Context, credential account.Credential) error {
+	s.clearVerifiedThinking(credential.ID)
 	disabled := false
 	if _, err := s.accounts.UpdateMany(ctx, credential.Provider, []uint64{credential.ID}, repository.AccountUpdates{Enabled: &disabled}); err != nil {
 		return err

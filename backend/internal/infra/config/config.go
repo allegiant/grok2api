@@ -801,8 +801,8 @@ func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) erro
 	if !value.Enabled && !value.AutoDisable {
 		return nil
 	}
-	if value.MaxAttempts != 0 && (value.MaxAttempts < 1 || value.MaxAttempts > 6) {
-		return errors.New("qualityGuard.requestRetry.maxAttempts 必须在 1 到 6 之间")
+	if value.MaxAttempts != 0 && (value.MaxAttempts < 1 || value.MaxAttempts > 100) {
+		return errors.New("qualityGuard.requestRetry.maxAttempts 必须在 1 到 100 之间")
 	}
 	if d := value.HoldTimeout.Value(); d != 0 && (d < 200*time.Millisecond || d > 30*time.Second) {
 		return errors.New("qualityGuard.requestRetry.holdTimeout 必须在 200ms 到 30s 之间")

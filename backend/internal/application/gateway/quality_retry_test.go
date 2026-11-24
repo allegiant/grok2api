@@ -2359,13 +2359,13 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 		}
 	})
 
-	t.Run("multi-account clean 0-reasoning exhaustion rejects under fail_closed with short anti-cascade cooldown", func(t *testing.T) {
+	t.Run("multi-account clean 0-reasoning exhaustion rejects under fail_closed and applies full penalty", func(t *testing.T) {
 		ctx := context.Background()
 		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-anti-cascade.db", responses)
+		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-strict-penalty.db", responses)
 		service.UpdateQualityRetry(QualityRetryRuntime{
 			Enabled: true, MaxAttempts: 3, MinOutputTokens: 8,
-			AutoDisable: true, AccountCooldown: 24 * time.Hour, IdleAccountCooldown: 15 * time.Minute,
+			AutoDisable: false, AccountCooldown: 24 * time.Hour, IdleAccountCooldown: 15 * time.Minute,
 			OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
 		})
 		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
@@ -2389,15 +2389,12 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 		}
 		for _, cred := range credentials {
 			acct, _ := accountRepo.Get(ctx, cred.ID)
-			if !acct.Enabled {
-				t.Fatalf("multi-account clean exhaustion must not auto-disable account %d: %#v", cred.ID, acct)
-			}
-			if acct.CooldownUntil == nil {
-				t.Fatalf("account %d must receive short cooldown: %#v", cred.ID, acct)
+			if acct.CooldownUntil == nil || acct.LastError != lastErrorMissingThinking {
+				t.Fatalf("account %d must receive full missing-thinking cooldown: %#v", cred.ID, acct)
 			}
 			remaining := time.Until(*acct.CooldownUntil)
-			if remaining > 16*time.Minute || remaining < 10*time.Minute {
-				t.Fatalf("expected ~15m short anti-cascade cooldown for account %d, got %s", cred.ID, remaining)
+			if remaining < 23*time.Hour {
+				t.Fatalf("expected full ~24h cooldown for degraded account %d, got %s", cred.ID, remaining)
 			}
 		}
 		logs, _, _ := auditRepo.List(ctx, 0, 10)
@@ -2409,6 +2406,133 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 		}
 		if degradedAudits != 3 {
 			t.Fatalf("expected 3 quality_degraded attempt audits, got %d", degradedAudits)
+		}
+	})
+
+	t.Run("verified thinking stream is exempt from buffered burst speed penalty and prioritized on new sessions", func(t *testing.T) {
+		ctx := context.Background()
+		database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "mt-verified-thinking.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer database.Close()
+		if err := database.InitializeSchema(ctx); err != nil {
+			t.Fatal(err)
+		}
+		accountRepo := relational.NewAccountRepository(database)
+		modelRepo := relational.NewModelRepository(database)
+		auditRepo := relational.NewAuditRepository(database)
+		responseRepo := relational.NewResponseRepository(database)
+		keyRepo := relational.NewClientKeyRepository(database)
+
+		var equalPriority []accountdomain.Credential
+		for _, name := range []string{"eq-untested-1", "eq-good-2", "eq-untested-3"} {
+			cred, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+				Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name,
+				EncryptedAccessToken: name, EncryptedRefreshToken: "refresh-" + name,
+				ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+				AuthStatus: accountdomain.AuthStatusActive, Priority: 100, MaxConcurrent: 4,
+			})
+			if createErr != nil {
+				t.Fatal(createErr)
+			}
+			equalPriority = append(equalPriority, cred)
+		}
+		if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.7"}); err != nil {
+			t.Fatal(err)
+		}
+		for _, cred := range equalPriority {
+			if err := modelRepo.ReplaceAccountCapabilities(ctx, cred.ID, []string{"grok-4.7"}, time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		key, err := keyRepo.Create(ctx, clientkey.Key{
+			Name: "eq-key", Prefix: "qeqs", SecretHash: strings.Repeat("b", 64),
+			EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Stream with streamed summary_text thinking + 4 function calls where usage omits reasoning_tokens (0)
+		// and buffered delivery would otherwise look like a 10,000+ tok/s burst.
+		conciseSummaryToolCall := sse(
+			`data: {"type":"response.created","response":{"id":"resp-concise","model":"grok-4.7"}}`,
+			`data: {"type":"response.reasoning_summary_text.delta","delta":"analyzing 122KB context carefully"}`,
+			`data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read","arguments":""}}`,
+			`data: {"type":"response.function_call_arguments.delta","delta":"{\"path\":\"a.go\"}"}`,
+			`data: {"type":"response.completed","response":{"id":"resp-concise","model":"grok-4.7","usage":{"output_tokens":96,"output_tokens_details":{"reasoning_tokens":24}}}}`,
+		)
+		responses := map[uint64][]scriptedBuildResponse{
+			equalPriority[0].ID: {{status: http.StatusOK, body: cleanToolCallNoReasoning}},
+			equalPriority[1].ID: {
+				{status: http.StatusOK, body: conciseSummaryToolCall},
+				{status: http.StatusOK, body: conciseSummaryToolCall},
+				{status: http.StatusOK, body: conciseSummaryToolCall},
+			},
+			equalPriority[2].ID: {{status: http.StatusOK, body: cleanToolCallNoReasoning}},
+		}
+		adapter := &scriptedBuildAdapter{responses: responses}
+		registry := provider.NewRegistry(adapter)
+		sticky := memory.NewStickyStore()
+		accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+		selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+		service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 10)
+		service.UpdateQualityRetry(QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 10, MinOutputTokens: 8,
+			AutoDisable: true, AccountCooldown: 24 * time.Hour,
+			SoftTPS: 10, HardTPS: 20, MinGenerationMS: 1000, FailClosed: true,
+			OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
+		})
+
+		// Session A: eq-untested-1 degrades and is auto-disabled; eq-good-2 delivers concise thinking.
+		res1, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-eq-1", ClientKey: key, PublicModel: "grok-4.7",
+			PromptCacheSeed: "session-A", Streaming: true, Body: toolContinuationBody,
+		})
+		if err != nil {
+			t.Fatalf("session-A turn 1 failed: %v", err)
+		}
+		_, _ = io.ReadAll(res1.Body)
+		if res1.MarkFirstToken != nil {
+			res1.MarkFirstToken()
+		}
+		time.Sleep(2 * time.Millisecond)
+		res1.Finalize(Usage{Reported: true, OutputTokens: 96, ReasoningTokens: 0}, "resp-concise", "")
+		_ = res1.Body.Close()
+
+		goodAcct, _ := accountRepo.Get(ctx, equalPriority[1].ID)
+		if !goodAcct.Enabled || goodAcct.CooldownUntil != nil {
+			t.Fatalf("proven-thinking account must NOT be disabled or cooled by post-hold speed penalty: %#v", goodAcct)
+		}
+
+		// Session A Turn 2: must stay sticky on eq-good-2 instead of jumping to eq-untested-3.
+		res2, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-eq-2", ClientKey: key, PublicModel: "grok-4.7",
+			PromptCacheSeed: "session-A", Streaming: true, Body: toolContinuationBody,
+		})
+		if err != nil {
+			t.Fatalf("session-A turn 2 failed: %v", err)
+		}
+		_, _ = io.ReadAll(res2.Body)
+		res2.Finalize(Usage{Reported: true, OutputTokens: 96, ReasoningTokens: 0}, "resp-concise-2", "")
+		_ = res2.Body.Close()
+
+		// Brand-new Session B: must prefer proven-thinking eq-good-2 over untested eq-untested-3!
+		res3, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-eq-3", ClientKey: key, PublicModel: "grok-4.7",
+			PromptCacheSeed: "session-B", Streaming: true, Body: toolContinuationBody,
+		})
+		if err != nil {
+			t.Fatalf("session-B turn 1 failed: %v", err)
+		}
+		_, _ = io.ReadAll(res3.Body)
+		res3.Finalize(Usage{Reported: true, OutputTokens: 96, ReasoningTokens: 0}, "resp-concise-3", "")
+		_ = res3.Body.Close()
+
+		gotAttempts := adapter.Attempts()
+		wantAttempts := []uint64{equalPriority[0].ID, equalPriority[1].ID, equalPriority[1].ID, equalPriority[1].ID}
+		if fmt.Sprint(gotAttempts) != fmt.Sprint(wantAttempts) {
+			t.Fatalf("attempts = %v, want %v (sticky + verified-thinking priority)", gotAttempts, wantAttempts)
 		}
 	})
 

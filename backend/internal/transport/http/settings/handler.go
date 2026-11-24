@@ -131,6 +131,7 @@ type clientKeyDefaultsConfigDTO struct {
 
 type accountsConfigDTO struct {
 	AutoDisableDegradedAccounts          *bool     `json:"autoDisableDegradedAccounts,omitempty"`
+	QualityRetryMaxAttempts              *int      `json:"qualityRetryMaxAttempts,omitempty"`
 	MarkBuildForbiddenReauth             *bool     `json:"markBuildForbiddenReauth,omitempty"`
 	BuildForbiddenReauthCodes            *[]string `json:"buildForbiddenReauthCodes,omitempty"`
 	ExcludeBuildBotFlaggedFromScheduling *bool     `json:"excludeBuildBotFlaggedFromScheduling,omitempty"`
@@ -256,6 +257,8 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 		result.Accounts = settingsapp.AccountsConfig{
 			AutoDisableDegradedAccounts:                  boolValue(value.Accounts.AutoDisableDegradedAccounts),
 			AutoDisableDegradedAccountsProvided:          value.Accounts.AutoDisableDegradedAccounts != nil,
+			QualityRetryMaxAttempts:                      intValue(value.Accounts.QualityRetryMaxAttempts),
+			QualityRetryMaxAttemptsProvided:              value.Accounts.QualityRetryMaxAttempts != nil,
 			MarkBuildForbiddenReauth:                     boolValue(value.Accounts.MarkBuildForbiddenReauth),
 			BuildForbiddenReauthCodes:                    stringSliceValue(value.Accounts.BuildForbiddenReauthCodes),
 			ExcludeBuildBotFlaggedFromScheduling:         boolValue(value.Accounts.ExcludeBuildBotFlaggedFromScheduling),
@@ -336,6 +339,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 			},
 			Accounts: &accountsConfigDTO{
 				AutoDisableDegradedAccounts:          boolPointer(config.Accounts.AutoDisableDegradedAccounts),
+				QualityRetryMaxAttempts:              intPointer(config.Accounts.QualityRetryMaxAttempts),
 				MarkBuildForbiddenReauth:             boolPointer(config.Accounts.MarkBuildForbiddenReauth),
 				BuildForbiddenReauthCodes:            stringSlicePointer(config.Accounts.BuildForbiddenReauthCodes),
 				ExcludeBuildBotFlaggedFromScheduling: boolPointer(config.Accounts.ExcludeBuildBotFlaggedFromScheduling),

@@ -103,13 +103,24 @@ type firstByteReadCloser struct {
 }
 
 type firstTokenTimer struct {
-	started time.Time
-	once    sync.Once
-	encoded atomic.Int64
+	started  time.Time
+	hintNano atomic.Int64
+	once     sync.Once
+	encoded  atomic.Int64
 }
 
 func newFirstTokenTimer(started time.Time) *firstTokenTimer {
 	return &firstTokenTimer{started: started}
+}
+
+// setUpstreamHint records the wall-clock instant when a held upstream stream
+// first emitted real reasoning, visible text, or tool output so flushing a
+// buffered prefix does not collapse FirstTokenMS onto DurationMS.
+func (t *firstTokenTimer) setUpstreamHint(at time.Time) {
+	if t == nil || at.IsZero() {
+		return
+	}
+	t.hintNano.CompareAndSwap(0, at.UnixNano())
 }
 
 func (t *firstTokenTimer) mark() {
@@ -117,7 +128,14 @@ func (t *firstTokenTimer) mark() {
 		return
 	}
 	t.once.Do(func() {
-		elapsedMS := max(int64(0), time.Since(t.started).Milliseconds())
+		now := time.Now()
+		observedAt := now
+		if hint := t.hintNano.Load(); hint > 0 {
+			if hintedAt := time.Unix(0, hint); hintedAt.Before(now) {
+				observedAt = hintedAt
+			}
+		}
+		elapsedMS := max(int64(0), observedAt.Sub(t.started).Milliseconds())
 		t.encoded.Store(elapsedMS + 1)
 	})
 }

@@ -28,6 +28,7 @@ export type SettingsConfigDTO = {
   clientKeyDefaults: { rpmLimit: number; maxConcurrent: number };
   accounts: {
     autoDisableDegradedAccounts: boolean;
+    qualityRetryMaxAttempts: number;
     markBuildForbiddenReauth: boolean;
     buildForbiddenReauthCodes: string[];
     excludeBuildBotFlaggedFromScheduling: boolean;
@@ -142,6 +143,7 @@ const settingsConfigValidator = hasShape({
   // Older backends may omit accounts; withSettingsDefaults supplies a safe local default.
   accounts: isOptional(hasShape({
     autoDisableDegradedAccounts: isOptional(isBoolean),
+    qualityRetryMaxAttempts: isOptional(isNumber),
     markBuildForbiddenReauth: isOptional(isBoolean),
     buildForbiddenReauthCodes: isOptional(isArrayOf(isString)),
     excludeBuildBotFlaggedFromScheduling: isOptional(isBoolean),
@@ -154,6 +156,7 @@ const settingsConfigValidator = hasShape({
 });
 const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
   autoDisableDegradedAccounts: false,
+  qualityRetryMaxAttempts: 6,
   markBuildForbiddenReauth: false,
   buildForbiddenReauthCodes: ["permission-denied"],
   excludeBuildBotFlaggedFromScheduling: false,
@@ -195,6 +198,7 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
       },
       accounts: {
         autoDisableDegradedAccounts: accounts.autoDisableDegradedAccounts ?? false,
+        qualityRetryMaxAttempts: accounts.qualityRetryMaxAttempts || 6,
         markBuildForbiddenReauth: accounts.markBuildForbiddenReauth ?? false,
         buildForbiddenReauthCodes: accounts.buildForbiddenReauthCodes ?? ["permission-denied"],
         excludeBuildBotFlaggedFromScheduling: accounts.excludeBuildBotFlaggedFromScheduling ?? false,

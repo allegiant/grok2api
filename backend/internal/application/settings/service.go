@@ -138,6 +138,7 @@ type ClientKeyDefaultsConfig struct {
 // AccountsConfig 是管理接口使用的账号池维护策略输入。
 type AccountsConfig struct {
 	AutoDisableDegradedAccounts bool
+	QualityRetryMaxAttempts     int
 	MarkBuildForbiddenReauth    bool
 	BuildForbiddenReauthCodes   []string
 	// ExcludeBuildBotFlaggedFromScheduling drops bot-risk Build accounts from scheduling only.
@@ -156,6 +157,8 @@ type AccountsConfig struct {
 	AutoDeleteConsoleUnlinkedProvided            bool
 	// AutoDisableDegradedAccountsProvided preserves config.yaml when an older management client omits the field.
 	AutoDisableDegradedAccountsProvided bool
+	// QualityRetryMaxAttemptsProvided preserves config.yaml when an older management client omits the field.
+	QualityRetryMaxAttemptsProvided bool
 }
 
 // EditableConfig 聚合管理端允许修改的运行参数。
@@ -448,6 +451,9 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	if value.Accounts.AutoDisableDegradedAccounts != nil {
 		base.QualityGuard.RequestRetry.AutoDisable = *value.Accounts.AutoDisableDegradedAccounts
 	}
+	if value.Accounts.QualityRetryMaxAttempts != nil {
+		base.QualityGuard.RequestRetry.MaxAttempts = *value.Accounts.QualityRetryMaxAttempts
+	}
 	return base
 }
 
@@ -455,6 +461,10 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 	randomDelay := value.Batch.RandomDelay.Value()
 	accountIsolatedConnections := value.Routing.AccountIsolatedConnections
 	autoDisableDegradedAccounts := value.QualityGuard.RequestRetry.AutoDisable
+	qualityRetryMaxAttempts := value.QualityGuard.RequestRetry.MaxAttempts
+	if qualityRetryMaxAttempts <= 0 {
+		qualityRetryMaxAttempts = 6
+	}
 	return settingsdomain.Config{
 		Server: settingsdomain.ServerConfig{MaxConcurrentRequests: value.Server.MaxConcurrentRequests},
 		ProviderBuild: settingsdomain.ProviderBuildConfig{
@@ -513,6 +523,7 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 		},
 		Accounts: settingsdomain.AccountsConfig{
 			AutoDisableDegradedAccounts:          &autoDisableDegradedAccounts,
+			QualityRetryMaxAttempts:              &qualityRetryMaxAttempts,
 			MarkBuildForbiddenReauth:             value.Accounts.MarkBuildForbiddenReauth,
 			BuildForbiddenReauthCodes:            append([]string(nil), value.Accounts.BuildForbiddenReauthCodes...),
 			ExcludeBuildBotFlaggedFromScheduling: value.Accounts.ExcludeBuildBotFlaggedFromScheduling,
@@ -615,6 +626,12 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		if input.Accounts.AutoDisableDegradedAccountsProvided {
 			next.QualityGuard.RequestRetry.AutoDisable = input.Accounts.AutoDisableDegradedAccounts
 		}
+		if input.Accounts.QualityRetryMaxAttemptsProvided {
+			if input.Accounts.QualityRetryMaxAttempts < 1 || input.Accounts.QualityRetryMaxAttempts > 100 {
+				return config.Config{}, errors.New("accounts.qualityRetryMaxAttempts 必须在 1 到 100 之间")
+			}
+			next.QualityGuard.RequestRetry.MaxAttempts = input.Accounts.QualityRetryMaxAttempts
+		}
 		if input.Accounts.MarkBuildForbiddenReauthProvided {
 			next.Accounts.MarkBuildForbiddenReauth = input.Accounts.MarkBuildForbiddenReauth
 		}
@@ -699,6 +716,10 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 }
 
 func toEditable(cfg config.Config) EditableConfig {
+	qualityRetryMaxAttempts := cfg.QualityGuard.RequestRetry.MaxAttempts
+	if qualityRetryMaxAttempts <= 0 {
+		qualityRetryMaxAttempts = 6
+	}
 	return EditableConfig{
 		Server: ServerConfig{MaxConcurrentRequests: cfg.Server.MaxConcurrentRequests},
 		ProviderBuild: ProviderBuildConfig{
@@ -760,6 +781,8 @@ func toEditable(cfg config.Config) EditableConfig {
 		Accounts: AccountsConfig{
 			AutoDisableDegradedAccounts:                  cfg.QualityGuard.RequestRetry.AutoDisable,
 			AutoDisableDegradedAccountsProvided:          true,
+			QualityRetryMaxAttempts:                      qualityRetryMaxAttempts,
+			QualityRetryMaxAttemptsProvided:              true,
 			MarkBuildForbiddenReauth:                     cfg.Accounts.MarkBuildForbiddenReauth,
 			BuildForbiddenReauthCodes:                    append([]string(nil), cfg.Accounts.BuildForbiddenReauthCodes...),
 			ExcludeBuildBotFlaggedFromScheduling:         cfg.Accounts.ExcludeBuildBotFlaggedFromScheduling,

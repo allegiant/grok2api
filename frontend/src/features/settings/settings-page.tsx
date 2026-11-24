@@ -445,6 +445,20 @@ export function SettingsPage() {
                     </div>
                   )} />
                 </SettingsField>
+                <SettingsField
+                  controlId="accounts-quality-retry-max-attempts"
+                  label={t("settings.accounts.qualityRetryMaxAttempts")}
+                  description={t("settings.accounts.qualityRetryMaxAttemptsHelp")}
+                  error={form.formState.errors.accounts?.qualityRetryMaxAttempts?.message}
+                >
+                  <Input
+                    id="accounts-quality-retry-max-attempts"
+                    type="number"
+                    min={1}
+                    max={100}
+                    {...form.register("accounts.qualityRetryMaxAttempts", { valueAsNumber: true })}
+                  />
+                </SettingsField>
               </div>
             </SettingsSection>
 

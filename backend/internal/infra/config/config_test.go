@@ -243,11 +243,16 @@ func TestAutoDisableValidatesRequestPolicyWithoutSidecar(t *testing.T) {
 	if err := validateQualityGuardConfig(shortReplyFloor); err != nil {
 		t.Fatalf("4-token output floor should be valid: %v", err)
 	}
+	highRetry := base
+	highRetry.RequestRetry.MaxAttempts = 30
+	if err := validateQualityGuardConfig(highRetry); err != nil {
+		t.Fatalf("30-attempt quality retry limit should be valid: %v", err)
+	}
 	for _, test := range []struct {
 		name   string
 		change func(*QualityGuardConfig)
 	}{
-		{"retry limit", func(c *QualityGuardConfig) { c.RequestRetry.MaxAttempts = 7 }},
+		{"retry limit", func(c *QualityGuardConfig) { c.RequestRetry.MaxAttempts = 101 }},
 		{"hold timeout", func(c *QualityGuardConfig) { c.RequestRetry.HoldTimeout = Duration(time.Minute) }},
 		{"output floor below minimum", func(c *QualityGuardConfig) { c.RequestRetry.MinOutputTokens = -1 }},
 		{"soft TPS", func(c *QualityGuardConfig) { c.SoftTPS = 0 }},

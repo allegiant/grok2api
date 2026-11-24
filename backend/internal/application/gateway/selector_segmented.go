@@ -21,14 +21,15 @@ type segmentedSelectorState struct {
 }
 
 type segmentedSelectorCohort struct {
-	supportsModel   bool
-	capabilityKnown bool
-	quotaKnown      bool
-	quotaAvailable  bool
-	preferFreeBuild bool
-	tier            int
-	priority        int
-	billingFresh    bool
+	supportsModel    bool
+	capabilityKnown  bool
+	quotaKnown       bool
+	quotaAvailable   bool
+	preferFreeBuild  bool
+	tier             int
+	priority         int
+	verifiedThinking bool
+	billingFresh     bool
 }
 
 type selectorLeaseObservation struct {
@@ -111,6 +112,9 @@ func segmentedSelectorCohortBetter(left, right segmentedSelectorCohort) bool {
 	}
 	if left.priority != right.priority {
 		return left.priority > right.priority
+	}
+	if left.verifiedThinking != right.verifiedThinking {
+		return left.verifiedThinking
 	}
 	if left.billingFresh != right.billingFresh {
 		return left.billingFresh

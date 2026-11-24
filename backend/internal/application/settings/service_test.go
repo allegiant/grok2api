@@ -867,8 +867,10 @@ func TestUpdateAutoDisableDegradedAccountsRoundTrip(t *testing.T) {
 func TestLoadPersistedKeepsYAMLAutoDisableForOlderPayload(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.QualityGuard.RequestRetry.AutoDisable = true
+	cfg.QualityGuard.RequestRetry.MaxAttempts = 25
 	value := toDomainConfig(cfg)
 	value.Accounts.AutoDisableDegradedAccounts = nil
+	value.Accounts.QualityRetryMaxAttempts = nil
 
 	loaded, _, _, err := LoadPersisted(context.Background(), cfg, &runtimeSettingsRepositoryStub{value: value, found: true})
 	if err != nil {
@@ -876,6 +878,34 @@ func TestLoadPersistedKeepsYAMLAutoDisableForOlderPayload(t *testing.T) {
 	}
 	if !loaded.QualityGuard.RequestRetry.AutoDisable {
 		t.Fatal("legacy runtime settings overrode config.yaml autoDisable")
+	}
+	if loaded.QualityGuard.RequestRetry.MaxAttempts != 25 {
+		t.Fatalf("legacy runtime settings overrode config.yaml maxAttempts: got %d, want 25", loaded.QualityGuard.RequestRetry.MaxAttempts)
+	}
+}
+
+func TestUpdateQualityRetryMaxAttemptsRoundTrip(t *testing.T) {
+	cfg := testConfig(t)
+	repo := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repo, nil, func(next config.Config) { applied = next })
+	input := service.Get().Config
+	input.Accounts.QualityRetryMaxAttempts = 30
+	input.Accounts.QualityRetryMaxAttemptsProvided = true
+
+	snapshot, err := service.Update(context.Background(), 0, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.QualityGuard.RequestRetry.MaxAttempts != 30 || snapshot.Config.Accounts.QualityRetryMaxAttempts != 30 {
+		t.Fatalf("quality retry maxAttempts was not applied: applied=%d snapshot=%#v", applied.QualityGuard.RequestRetry.MaxAttempts, snapshot.Config.Accounts)
+	}
+	reloaded, _, _, err := LoadPersisted(context.Background(), cfg, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.QualityGuard.RequestRetry.MaxAttempts != 30 {
+		t.Fatalf("persisted quality retry maxAttempts = %d, want 30", reloaded.QualityGuard.RequestRetry.MaxAttempts)
 	}
 }
 
