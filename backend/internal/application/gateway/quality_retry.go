@@ -80,8 +80,9 @@ type QualityStreamSignals struct {
 	// ReasoningStarted is an empty reasoning item or the Chat SSE stub
 	// `: grok2api-reasoning-start`. That is not proof of thinking: 降智
 	// still emits the stub, then dumps visible tokens with usage 0.
-	ReasoningStarted bool
-	VisibleTokens    int64
+	ReasoningStarted      bool
+	EncryptedContentValid bool
+	VisibleTokens         int64
 	ReasoningTokens  int64
 	OutputTokens     int64
 	EncryptedBytes   int
@@ -221,6 +222,9 @@ func qualityHasValidThinking(sig QualityStreamSignals) bool {
 func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
 	_ = minOutput
 	if sig.HasReasoningDelta {
+		return false
+	}
+	if sig.EncryptedContentValid && qualityHasValidThinking(sig) {
 		return false
 	}
 	visible := sig.VisibleTokens
@@ -632,6 +636,84 @@ func qualityRequestDisablesReasoning(body []byte) bool {
 func jsonStringEquals(raw json.RawMessage, want string) bool {
 	var value string
 	return json.Unmarshal(raw, &value) == nil && strings.EqualFold(strings.TrimSpace(value), want)
+}
+
+// isToolResultContinuationRequest reports whether the active turn is feeding
+// tool execution output back into an in-flight tool loop rather than starting
+// a new user prompt. Only the trailing effective input item is inspected so a
+// multi-turn chat ending with a fresh user question still requires thinking.
+func isToolResultContinuationRequest(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil || payload == nil {
+		return false
+	}
+	if rawInput, ok := payload["input"]; ok {
+		var items []json.RawMessage
+		if json.Unmarshal(rawInput, &items) == nil && len(items) > 0 {
+			for index := len(items) - 1; index >= 0; index-- {
+				var item struct {
+					Type string `json:"type"`
+					Role string `json:"role"`
+				}
+				if json.Unmarshal(items[index], &item) != nil {
+					return false
+				}
+				itemType := strings.ToLower(strings.TrimSpace(item.Type))
+				if itemType == "additional_tools" {
+					continue
+				}
+				if isToolResultItemType(itemType) {
+					return true
+				}
+				role := strings.ToLower(strings.TrimSpace(item.Role))
+				return role == "tool" || role == "function"
+			}
+		}
+		return false
+	}
+	if rawMessages, ok := payload["messages"]; ok {
+		var messages []json.RawMessage
+		if json.Unmarshal(rawMessages, &messages) == nil && len(messages) > 0 {
+			var last struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			}
+			if json.Unmarshal(messages[len(messages)-1], &last) != nil {
+				return false
+			}
+			role := strings.ToLower(strings.TrimSpace(last.Role))
+			if role == "tool" || role == "function" {
+				return true
+			}
+			if role == "user" && len(last.Content) > 0 {
+				var blocks []struct {
+					Type string `json:"type"`
+				}
+				if json.Unmarshal(last.Content, &blocks) == nil {
+					for _, block := range blocks {
+						if strings.EqualFold(strings.TrimSpace(block.Type), "tool_result") {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func isToolResultItemType(itemType string) bool {
+	switch itemType {
+	case "function_call_output", "custom_tool_call_output", "computer_call_output",
+		"shell_call_output", "local_shell_call_output", "apply_patch_call_output",
+		"mcp_call_output", "mcp_tool_call_output", "tool_search_output", "tool_result":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) applyMissingThinkingPenalty(ctx context.Context, requestID string, credential accountdomain.Credential, cooldown time.Duration, autoDisable bool) {

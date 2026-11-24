@@ -76,6 +76,11 @@ func TestClassifyQualityHoldBurst(t *testing.T) {
 			want: QualityWithhold,
 		},
 		{
+			name: "hold-expired valid encrypted short answer delivers at terminal",
+			sig:  QualityStreamSignals{HasThinking: true, EncryptedContentValid: true, VisibleTokens: 20, OutputTokens: 1320, ReasoningTokens: 1289, EncryptedBytes: 7802, EncryptedFloor: 5156, HoldExpired: true, Terminal: true, UsageReported: true},
+			want: QualityDeliver,
+		},
+		{
 			name: "hold-expired long answer still waiting without flush",
 			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 200, ReasoningTokens: 954, EncryptedBytes: 8000, EncryptedFloor: 3816, HoldExpired: true},
 			want: QualityWait,
@@ -2125,59 +2130,140 @@ func TestObserveQualityChunkValidGrokEncryptedContentAndDoneSummaryDeliver(t *te
 	if got := ClassifyQualityHold(shortSig, 8); got != QualityDeliver {
 		t.Fatalf("short valid Grok Build encrypted_content at terminal got %s, want deliver (%#v)", got, shortSig)
 	}
+	if !shortCipher.peekMetadata().Stream.HasThinking {
+		t.Fatalf("peekMetadata Stream.HasThinking must reflect valid encrypted thinking: %#v", shortCipher.peekMetadata())
+	}
+
+	// Hold-expired stream with valid high-entropy encrypted_content and <32 visible tokens must deliver at terminal.
+	holdExpiredValid := qualityScanState{protocol: qualityProtocolResponses, holdExpired: true}
+	ObserveQualityChunk(&holdExpiredValid, []byte(sse(
+		`data: {"type":"response.output_item.added","item":{"id":"rs_slow","type":"reasoning"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_slow","type":"reasoning","summary":[],"encrypted_content":"`+validCipher+`"}}`,
+		`data: {"type":"response.output_text.delta","delta":"concise answer"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_slow","model":"grok-4.7","usage":{"output_tokens":1320,"output_tokens_details":{"reasoning_tokens":1289}}}}`,
+	)))
+	holdExpiredSig := holdExpiredValid.signals()
+	if !holdExpiredSig.EncryptedContentValid || ClassifyQualityHold(holdExpiredSig, 8) != QualityDeliver {
+		t.Fatalf("hold-expired valid encrypted short answer must deliver, got %s (%#v)", ClassifyQualityHold(holdExpiredSig, 8), holdExpiredSig)
+	}
 }
 
-func TestAttemptLoopMultiTurnWithholdsZeroReasoningUntilThinkingAccountSucceeds(t *testing.T) {
-	ctx := context.Background()
-	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-multiturn-strict.db"))
-	if err != nil {
-		t.Fatal(err)
+func TestIsToolResultContinuationRequest(t *testing.T) {
+	t.Parallel()
+	trueCases := []struct {
+		name string
+		body string
+	}{
+		{name: "responses function_call_output", body: `{"input":[{"role":"user","content":"hi"},{"type":"function_call","call_id":"c1","name":"ls","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"}]}`},
+		{name: "responses custom_tool_call_output", body: `{"input":[{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}]}`},
+		{name: "responses shell_call_output with trailing additional_tools", body: `{"input":[{"type":"shell_call_output","call_id":"c1","output":[]},{"type":"additional_tools","tools":[]}]}`},
+		{name: "chat role tool", body: `{"messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[]},{"role":"tool","tool_call_id":"c1","content":"ok"}]}`},
+		{name: "anthropic tool_result with system reminder", body: `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"},{"type":"text","text":"<system-reminder>info</system-reminder>"}]}]}`},
 	}
-	defer database.Close()
-	if err := database.InitializeSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
-	accountRepo := relational.NewAccountRepository(database)
-	modelRepo := relational.NewModelRepository(database)
-	auditRepo := relational.NewAuditRepository(database)
-	responseRepo := relational.NewResponseRepository(database)
-	keyRepo := relational.NewClientKeyRepository(database)
-
-	credentials := make([]accountdomain.Credential, 0, 3)
-	for index, name := range []string{"mt-acct-1", "mt-acct-2", "mt-acct-3"} {
-		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
-			Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name,
-			EncryptedAccessToken: name, EncryptedRefreshToken: "refresh-" + name,
-			ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
-			AuthStatus: accountdomain.AuthStatusActive, Priority: 200 - index, MaxConcurrent: 1,
-		})
-		if createErr != nil {
-			t.Fatal(createErr)
+	for _, tc := range trueCases {
+		if !isToolResultContinuationRequest([]byte(tc.body)) {
+			t.Fatalf("%s: expected true for %s", tc.name, tc.body)
 		}
-		credentials = append(credentials, credential)
 	}
-	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.7"}); err != nil {
-		t.Fatal(err)
+
+	falseCases := []struct {
+		name string
+		body string
+	}{
+		{name: "responses string input", body: `{"input":"hello"}`},
+		{name: "responses first user message", body: `{"input":[{"role":"user","content":"hello"}]}`},
+		{name: "responses multi-turn ending with new user question", body: `{"input":[{"role":"user","content":"q1"},{"type":"function_call","call_id":"c1","name":"ls","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"},{"role":"user","content":"now explain"}]}`},
+		{name: "chat multi-turn ending with new user question", body: `{"messages":[{"role":"user","content":"q1"},{"role":"tool","content":"ok"},{"role":"user","content":"q2"}]}`},
+		{name: "anthropic plain user text blocks", body: `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`},
 	}
-	for _, credential := range credentials {
-		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.7"}, time.Now().UTC()); err != nil {
+	for _, tc := range falseCases {
+		if isToolResultContinuationRequest([]byte(tc.body)) {
+			t.Fatalf("%s: expected false for %s", tc.name, tc.body)
+		}
+	}
+}
+
+func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) {
+	newHarness := func(t *testing.T, dbName string, responses map[uint64][]scriptedBuildResponse) (*Service, *scriptedBuildAdapter, *relational.AccountRepository, *relational.AuditRepository, *memory.StickyStore, []accountdomain.Credential, clientkey.Key) {
+		t.Helper()
+		ctx := context.Background()
+		database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), dbName))
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
-		Name: "mt-strict-key", Prefix: "qmts", SecretHash: strings.Repeat("c", 64),
-		EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
-	})
-	if err != nil {
-		t.Fatal(err)
+		t.Cleanup(func() { _ = database.Close() })
+		if err := database.InitializeSchema(ctx); err != nil {
+			t.Fatal(err)
+		}
+		accountRepo := relational.NewAccountRepository(database)
+		modelRepo := relational.NewModelRepository(database)
+		auditRepo := relational.NewAuditRepository(database)
+		responseRepo := relational.NewResponseRepository(database)
+		keyRepo := relational.NewClientKeyRepository(database)
+
+		credentials := make([]accountdomain.Credential, 0, 3)
+		for index, name := range []string{"mt-acct-1", "mt-acct-2", "mt-acct-3"} {
+			credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+				Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name,
+				EncryptedAccessToken: name, EncryptedRefreshToken: "refresh-" + name,
+				ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+				AuthStatus: accountdomain.AuthStatusActive, Priority: 200 - index, MaxConcurrent: 1,
+			})
+			if createErr != nil {
+				t.Fatal(createErr)
+			}
+			credentials = append(credentials, credential)
+		}
+		if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.7"}); err != nil {
+			t.Fatal(err)
+		}
+		for _, credential := range credentials {
+			if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.7"}, time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		key, err := keyRepo.Create(ctx, clientkey.Key{
+			Name: "mt-key", Prefix: "qmts", SecretHash: strings.Repeat("c", 64),
+			EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		adapter := &scriptedBuildAdapter{responses: responses}
+		registry := provider.NewRegistry(adapter)
+		sticky := memory.NewStickyStore()
+		accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+		selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+		service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 6)
+		service.UpdateQualityRetry(QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 6, MinOutputTokens: 8,
+			OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
+		})
+		return service, adapter, accountRepo, auditRepo, sticky, credentials, key
 	}
 
-	toolCallNoReasoning := sse(
-		`data: {"type":"response.created","response":{"id":"resp-mt-bad","model":"grok-4.7"}}`,
+	cleanToolCallNoReasoning := sse(
+		`data: {"type":"response.created","response":{"id":"resp-mt-clean","model":"grok-4.7"}}`,
 		`data: {"type":"response.output_item.added","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":""}}`,
 		`data: {"type":"response.function_call_arguments.delta","delta":"{\"cmd\":\"pwd\"}"}`,
 		`data: {"type":"response.output_item.done","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":"{\"cmd\":\"pwd\"}"}}`,
-		`data: {"type":"response.completed","response":{"id":"resp-mt-bad","model":"grok-4.7","usage":{"output_tokens":42,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+		`data: {"type":"response.completed","response":{"id":"resp-mt-clean","model":"grok-4.7","usage":{"output_tokens":26,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+	)
+	stubNoReasoning := sse(
+		`data: {"type":"response.created","response":{"id":"resp-mt-stub","model":"grok-4.7"}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_stub","type":"reasoning"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_stub","type":"reasoning","encrypted_content":"`+strings.Repeat("A", 300)+`"}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":""}}`,
+		`data: {"type":"response.function_call_arguments.delta","delta":"{\"cmd\":\"pwd\"}"}`,
+		`data: {"type":"response.completed","response":{"id":"resp-mt-stub","model":"grok-4.7","usage":{"output_tokens":42,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+	)
+	cleanTextStreamNoReasoning := sse(
+		`data: {"type":"response.created","response":{"id":"resp-mt-text","model":"grok-4.7"}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"msg_1","type":"message","role":"assistant"}}`,
+		`data: {"type":"response.output_text.delta","delta":"first chunk of visible continuation text "}`,
+		`data: {"type":"response.output_text.delta","delta":"second chunk after midstream threshold "}`,
+		`data: {"type":"response.output_text.delta","delta":"TAIL_CHUNK_DELIVERED"}`,
+		`data: {"type":"response.completed","response":{"id":"resp-mt-text","model":"grok-4.7","usage":{"output_tokens":30,"output_tokens_details":{"reasoning_tokens":0}}}}`,
 	)
 	validCipher := testValidGrokEncryptedContent(13)
 	toolCallWithReasoning := sse(
@@ -2189,46 +2275,211 @@ func TestAttemptLoopMultiTurnWithholdsZeroReasoningUntilThinkingAccountSucceeds(
 		`data: {"type":"response.output_item.done","item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"shell","arguments":"{\"cmd\":\"pwd\"}"}}`,
 		`data: {"type":"response.completed","response":{"id":"resp-mt-ok","model":"grok-4.7","usage":{"output_tokens":142,"output_tokens_details":{"reasoning_tokens":100}}}}`,
 	)
-	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
-		credentials[0].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
-		credentials[1].ID: {{status: http.StatusOK, body: toolCallNoReasoning}},
-		credentials[2].ID: {{status: http.StatusOK, body: toolCallWithReasoning}},
-	}}
-	registry := provider.NewRegistry(adapter)
-	sticky := memory.NewStickyStore()
-	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
-	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
-	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 6)
-	service.UpdateQualityRetry(QualityRetryRuntime{
-		Enabled: true, MaxAttempts: 6, MinOutputTokens: 8,
-		OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
+	toolContinuationBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"},{"type":"reasoning","summary":[],"encrypted_content":"` + validCipher + `"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
+
+	t.Run("single degraded account before thinking account is cooled", func(t *testing.T) {
+		ctx := context.Background()
+		responses := make(map[uint64][]scriptedBuildResponse)
+		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-single-degraded.db", responses)
+		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
+		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
+
+		result, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-mt-1", ClientKey: key, PublicModel: "grok-4.7",
+			Streaming: true, Body: toolContinuationBody,
+		})
+		if err != nil {
+			t.Fatalf("expected retry onto thinking account, got err=%v", err)
+		}
+		body, _ := io.ReadAll(result.Body)
+		result.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
+		_ = result.Body.Close()
+		if !strings.Contains(string(body), validCipher) {
+			t.Fatalf("expected thinking response from 2nd account, got %s", body)
+		}
+		if attempts := adapter.Attempts(); len(attempts) != 2 {
+			t.Fatalf("expected 2 attempts, got %v", attempts)
+		}
+		acct0, _ := accountRepo.Get(ctx, credentials[0].ID)
+		acct1, _ := accountRepo.Get(ctx, credentials[1].ID)
+		if acct0.CooldownUntil == nil || acct0.LastError != lastErrorMissingThinking {
+			t.Fatalf("confirmed degraded account 0 must be cooled after account 1 proved thinking: %#v", acct0)
+		}
+		if acct1.CooldownUntil != nil {
+			t.Fatalf("healthy thinking account 1 must not be cooled: %#v", acct1)
+		}
+		logs, _, _ := auditRepo.List(ctx, 0, 10)
+		degradedAudits := 0
+		for _, rec := range logs {
+			if rec.ErrorCode == ErrorQualityDegraded && rec.AccountID != nil && *rec.AccountID == credentials[0].ID {
+				degradedAudits++
+			}
+		}
+		if degradedAudits != 1 {
+			t.Fatalf("expected exactly 1 quality_degraded audit for account 0, got %d", degradedAudits)
+		}
 	})
 
-	multiTurnBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
-	result, err := service.CreateResponse(ctx, Input{
-		RequestID: "req-mt-strict", ClientKey: clientKey, PublicModel: "grok-4.7",
-		Streaming: true, Body: multiTurnBody,
+	t.Run("two-account clean tool-call consensus delivers without cooldown and preserves sticky", func(t *testing.T) {
+		ctx := context.Background()
+		responses := make(map[uint64][]scriptedBuildResponse)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-tool-consensus.db", responses)
+		// Turn 1 binds sticky session to credentials[0] with valid thinking.
+		responses[credentials[0].ID] = []scriptedBuildResponse{
+			{status: http.StatusOK, body: toolCallWithReasoning},
+			{status: http.StatusOK, body: cleanToolCallNoReasoning},
+			{status: http.StatusOK, body: toolCallWithReasoning},
+		}
+		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
+		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
+
+		firstTurnBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"}]}`)
+		res1, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-turn-1", ClientKey: key, PublicModel: "grok-4.7",
+			PromptCacheSeed: "session-10888", Streaming: true, Body: firstTurnBody,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(res1.Body)
+		res1.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
+		_ = res1.Body.Close()
+
+		// Turn 2: both credentials[0] and credentials[1] return clean 0-reasoning function_call.
+		res2, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-turn-2", ClientKey: key, PublicModel: "grok-4.7",
+			PromptCacheSeed: "session-10888", Streaming: true, Body: toolContinuationBody,
+		})
+		if err != nil {
+			t.Fatalf("2-account tool continuation consensus must deliver instead of 503: %v", err)
+		}
+		body2, _ := io.ReadAll(res2.Body)
+		res2.Finalize(Usage{Reported: true, OutputTokens: 26, ReasoningTokens: 0}, "resp-mt-clean", "")
+		_ = res2.Body.Close()
+		if !strings.Contains(string(body2), `"call_2"`) {
+			t.Fatalf("expected clean tool call delivered, got %s", body2)
+		}
+		attempts := adapter.Attempts()
+		if len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[0].ID || attempts[2] != credentials[1].ID {
+			t.Fatalf("expected turn1->acct0 and turn2->acct0,acct1 consensus (not touching acct2), got %v", attempts)
+		}
+		for _, cred := range credentials[:2] {
+			acct, _ := accountRepo.Get(ctx, cred.ID)
+			if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
+				t.Fatalf("consensus account %d must not be cooled down: %#v", cred.ID, acct)
+			}
+		}
+
+		// Turn 3 (new user prompt) should route back to sticky credentials[0].
+		res3, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-turn-3", ClientKey: key, PublicModel: "grok-4.7",
+			PromptCacheSeed: "session-10888", Streaming: true, Body: firstTurnBody,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(res3.Body)
+		res3.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
+		_ = res3.Body.Close()
+		if got := adapter.Attempts(); len(got) != 4 || got[3] != credentials[0].ID {
+			t.Fatalf("sticky session should be restored to original healthy account %d, got attempts=%v", credentials[0].ID, got)
+		}
 	})
-	if err != nil {
-		t.Fatalf("multi-turn request should retry past 2 degraded accounts and deliver the 3rd thinking account: %v", err)
-	}
-	body, _ := io.ReadAll(result.Body)
-	result.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
-	_ = result.Body.Close()
-	if !strings.Contains(string(body), validCipher) {
-		t.Fatalf("expected thinking response from 3rd account, got %s", body)
-	}
-	attempts := adapter.Attempts()
-	if len(attempts) != 3 {
-		t.Fatalf("expected 3 attempts (2 withheld + 1 delivered), got attempts=%v", attempts)
-	}
-	for _, id := range attempts[:2] {
-		acct, getErr := accountRepo.Get(ctx, id)
-		if getErr != nil {
-			t.Fatal(getErr)
+
+	t.Run("two-account clean midstream text consensus streams full body without cooldown", func(t *testing.T) {
+		ctx := context.Background()
+		responses := make(map[uint64][]scriptedBuildResponse)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-text-consensus.db", responses)
+		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
+		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
+		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
+
+		result, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-mt-text", ClientKey: key, PublicModel: "grok-4.7",
+			Streaming: true, Body: toolContinuationBody,
+		})
+		if err != nil {
+			t.Fatalf("midstream text consensus must deliver instead of 503: %v", err)
 		}
-		if acct.CooldownUntil == nil || acct.LastError != lastErrorMissingThinking {
-			t.Fatalf("degraded account %d must be cooled down: %#v", id, acct)
+		body, _ := io.ReadAll(result.Body)
+		result.Finalize(Usage{Reported: true, OutputTokens: 30, ReasoningTokens: 0}, "resp-mt-text", "")
+		_ = result.Body.Close()
+		if !strings.Contains(string(body), "first chunk of visible continuation text") || !strings.Contains(string(body), "TAIL_CHUNK_DELIVERED") {
+			t.Fatalf("stream replay lost prefix or tail chunks: %s", body)
 		}
-	}
+		if attempts := adapter.Attempts(); len(attempts) != 2 {
+			t.Fatalf("expected 2 attempts for midstream text consensus, got %v", attempts)
+		}
+		for _, cred := range credentials[:2] {
+			acct, _ := accountRepo.Get(ctx, cred.ID)
+			if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
+				t.Fatalf("consensus account %d must not be cooled: %#v", cred.ID, acct)
+			}
+		}
+	})
+
+	t.Run("multi-turn ending with new user prompt enforces strict withhold", func(t *testing.T) {
+		ctx := context.Background()
+		responses := make(map[uint64][]scriptedBuildResponse)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-user-tail.db", responses)
+		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
+		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
+		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
+
+		userTailBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"},{"type":"message","role":"user","content":"now explain everything"}]}`)
+		result, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-mt-user-tail", ClientKey: key, PublicModel: "grok-4.7",
+			Streaming: true, Body: userTailBody,
+		})
+		if err != nil {
+			t.Fatalf("expected 3rd thinking account to deliver, got err=%v", err)
+		}
+		body, _ := io.ReadAll(result.Body)
+		result.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
+		_ = result.Body.Close()
+		if !strings.Contains(string(body), validCipher) {
+			t.Fatalf("expected thinking response from 3rd account, got %s", body)
+		}
+		if attempts := adapter.Attempts(); len(attempts) != 3 {
+			t.Fatalf("new user prompt must not form 0-reasoning consensus, got attempts=%v", attempts)
+		}
+		for _, cred := range credentials[:2] {
+			acct, _ := accountRepo.Get(ctx, cred.ID)
+			if acct.CooldownUntil == nil || acct.LastError != lastErrorMissingThinking {
+				t.Fatalf("degraded account %d on user prompt must be cooled: %#v", cred.ID, acct)
+			}
+		}
+	})
+
+	t.Run("malformed stub 0-reasoning on tool continuation never forms consensus", func(t *testing.T) {
+		ctx := context.Background()
+		responses := make(map[uint64][]scriptedBuildResponse)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-stub-no-consensus.db", responses)
+		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: stubNoReasoning}}
+		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: stubNoReasoning}}
+		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
+
+		result, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-mt-stub", ClientKey: key, PublicModel: "grok-4.7",
+			Streaming: true, Body: toolContinuationBody,
+		})
+		if err != nil {
+			t.Fatalf("expected retry past 2 malformed stubs onto 3rd thinking account, got err=%v", err)
+		}
+		body, _ := io.ReadAll(result.Body)
+		result.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
+		_ = result.Body.Close()
+		if !strings.Contains(string(body), validCipher) {
+			t.Fatalf("expected thinking response from 3rd account, got %s", body)
+		}
+		if attempts := adapter.Attempts(); len(attempts) != 3 {
+			t.Fatalf("malformed stubs must not form consensus, got attempts=%v", attempts)
+		}
+		for _, cred := range credentials[:2] {
+			acct, _ := accountRepo.Get(ctx, cred.ID)
+			if acct.CooldownUntil == nil || acct.LastError != lastErrorMissingThinking {
+				t.Fatalf("stub-emitting degraded account %d must be cooled: %#v", cred.ID, acct)
+			}
+		}
+	})
 }

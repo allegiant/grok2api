@@ -48,7 +48,8 @@ type qualityStreamDiagnostic struct {
 }
 
 type qualityPeekMetadata struct {
-	Stream qualityStreamDiagnostic
+	Stream                         qualityStreamDiagnostic
+	CleanZeroReasoningContinuation bool
 }
 
 type qualityScanState struct {
@@ -163,18 +164,32 @@ func marshalQualityDiagnosticJSON(value any) string {
 	return string(data)
 }
 
+func (s *qualityScanState) isCleanZeroReasoningContinuation(sig QualityStreamSignals) bool {
+	if s == nil {
+		return false
+	}
+	if s.hasThinking || s.reasoningStarted || s.encryptedBytes > 0 || sig.ReasoningTokens > 0 {
+		return false
+	}
+	return s.semanticOutput || sig.VisibleTokens > 0 || sig.OutputTokens > 0
+}
+
 func (s *qualityScanState) peekMetadata() qualityPeekMetadata {
 	if s == nil {
 		return qualityPeekMetadata{}
 	}
+	sig := s.signals()
 	stream := s.diagnostic
 	stream.Terminal = s.terminal
-	stream.ReasoningStarted = s.reasoningStarted
-	stream.HasThinking = s.hasThinking
+	stream.ReasoningStarted = sig.ReasoningStarted
+	stream.HasThinking = qualityHasValidThinking(sig)
 	stream.ReasoningPayloadBytes = s.encryptedBytes
 	stream.EncryptedContentValid = s.validEncryptedContent
 	stream.UsageReported = s.usage.Reported
-	return qualityPeekMetadata{Stream: stream}
+	return qualityPeekMetadata{
+		Stream:                         stream,
+		CleanZeroReasoningContinuation: s.isCleanZeroReasoningContinuation(sig),
+	}
 }
 
 type qualityReadResult struct {
@@ -304,19 +319,20 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		flushMS = time.Since(s.firstVisibleAt).Milliseconds()
 	}
 	return QualityStreamSignals{
-		HasThinking:       hasThinking,
-		HasReasoningDelta: s.hasThinking,
-		ReasoningStarted:  s.reasoningStarted || hasThinking,
-		VisibleTokens:     visible,
-		ReasoningTokens:   reasoningTokens,
-		OutputTokens:      output,
-		EncryptedBytes:    s.encryptedBytes,
-		EncryptedFloor:    floor,
-		UsageReported:     s.usage.Reported,
-		FirstVisible:      firstVisible,
-		VisibleFlushMS:    flushMS,
-		Terminal:          s.terminal,
-		HoldExpired:       s.holdExpired,
+		HasThinking:           hasThinking,
+		HasReasoningDelta:     s.hasThinking,
+		ReasoningStarted:      s.reasoningStarted || hasThinking,
+		EncryptedContentValid: s.validEncryptedContent,
+		VisibleTokens:         visible,
+		ReasoningTokens:       reasoningTokens,
+		OutputTokens:          output,
+		EncryptedBytes:        s.encryptedBytes,
+		EncryptedFloor:        floor,
+		UsageReported:         s.usage.Reported,
+		FirstVisible:          firstVisible,
+		VisibleFlushMS:        flushMS,
+		Terminal:              s.terminal,
+		HoldExpired:           s.holdExpired,
 	}
 }
 
