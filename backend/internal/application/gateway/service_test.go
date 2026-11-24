@@ -226,7 +226,7 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 		t.Fatalf("payment failover transient retries = %#v, want [0 0]", got)
 	}
 	identity := resolveBuildSessionIdentity(clientKey.ID, account.ProviderBuild, "grok-test", "", "claude-session", nil)
-	expectedCacheKey := identity.upstreamID
+	expectedCacheKey := scopeBuildPromptCacheKeyForAccount(identity.upstreamID, second.ID)
 	if adapter.lastPromptCacheKey != expectedCacheKey {
 		t.Fatalf("prompt cache key = %q, want %q", adapter.lastPromptCacheKey, expectedCacheKey)
 	}
@@ -4399,6 +4399,7 @@ type scriptedBuildAdapter struct {
 	mu               sync.Mutex
 	attempts         []uint64
 	transientRetries []int
+	promptCacheKeys  []string
 	responses        map[uint64][]scriptedBuildResponse
 	refreshes        atomic.Int64
 	lastRateLimit    *provider.RateLimitMetadata
@@ -4416,6 +4417,7 @@ func (a *scriptedBuildAdapter) ForwardResponse(_ context.Context, request provid
 	defer a.mu.Unlock()
 	a.attempts = append(a.attempts, request.Credential.ID)
 	a.transientRetries = append(a.transientRetries, request.TransientRetry)
+	a.promptCacheKeys = append(a.promptCacheKeys, request.PromptCacheKey)
 	queue := a.responses[request.Credential.ID]
 	if len(queue) == 0 {
 		return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":"resp-default"}`))}, nil
@@ -4449,6 +4451,11 @@ func (a *scriptedBuildAdapter) TransientRetries() []int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]int(nil), a.transientRetries...)
+}
+func (a *scriptedBuildAdapter) PromptCacheKeys() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.promptCacheKeys...)
 }
 
 type systemicForbiddenAdapter struct {

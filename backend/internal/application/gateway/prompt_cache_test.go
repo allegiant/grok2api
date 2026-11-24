@@ -138,3 +138,22 @@ func TestResolveBuildSessionIdentityUsesInstructionsAsSystemAnchor(t *testing.T)
 		t.Fatal("different instructions should isolate soft session")
 	}
 }
+
+func TestScopeBuildPromptCacheKeyForAccount(t *testing.T) {
+	base := resolveBuildSessionIdentity(7, accountdomain.ProviderBuild, "grok-4.7", "", "session-1", nil)
+	acct1 := scopeBuildPromptCacheKeyForAccount(base.upstreamID, 10837)
+	acct1Repeat := scopeBuildPromptCacheKeyForAccount(base.upstreamID, 10837)
+	acct2 := scopeBuildPromptCacheKeyForAccount(base.upstreamID, 7228)
+	if len(acct1) != 36 || acct1 != acct1Repeat {
+		t.Fatalf("per-account prompt cache key unstable: %q vs %q", acct1, acct1Repeat)
+	}
+	if acct1 == base.upstreamID || acct1 == acct2 {
+		t.Fatalf("per-account prompt cache key failed to isolate accounts: base=%q acct1=%q acct2=%q", base.upstreamID, acct1, acct2)
+	}
+	if got := scopeBuildPromptCacheKeyForAccount("", 10837); got != "" {
+		t.Fatalf("empty upstreamID must stay empty, got %q", got)
+	}
+	if got := scopeBuildPromptCacheKeyForAccount(base.upstreamID, 0); got != base.upstreamID {
+		t.Fatalf("zero accountID must preserve upstreamID, got %q want %q", got, base.upstreamID)
+	}
+}

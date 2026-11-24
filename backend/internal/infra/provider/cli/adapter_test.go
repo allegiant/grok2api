@@ -376,6 +376,59 @@ func TestForwardResponseMatchesGrokBuildHeadersAndPreservesReasoning(t *testing.
 	}
 }
 
+func TestForwardResponseIsolatesAgentIDAcrossScopedSessionsAndStatelessAccounts(t *testing.T) {
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seenAgentIDs []string
+	adapter := NewAdapter(Config{BaseURL: "https://cli-chat-proxy.grok.com/v1"}, cipher)
+	adapter.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		seenAgentIDs = append(seenAgentIDs, r.Header.Get("x-grok-agent-id"))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_1","object":"response"}`)),
+			Request:    r,
+		}, nil
+	})
+	cases := []struct {
+		credID uint64
+		cache  string
+	}{
+		{credID: 10837, cache: "acct-10837-session"},
+		{credID: 10837, cache: "acct-10837-session"},
+		{credID: 7228, cache: "acct-7228-session"},
+		{credID: 10837, cache: ""},
+		{credID: 7228, cache: ""},
+	}
+	for _, tc := range cases {
+		resp, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+			Credential:     account.Credential{ID: tc.credID, EncryptedAccessToken: encrypted},
+			Method:         http.MethodPost, Path: "/responses", Model: "grok-4.7",
+			PromptCacheKey: tc.cache, Body: []byte(`{}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+	if len(seenAgentIDs) != 5 || seenAgentIDs[0] != seenAgentIDs[1] || seenAgentIDs[0] == seenAgentIDs[2] || seenAgentIDs[3] == seenAgentIDs[4] {
+		t.Fatalf("expected stable x-grok-agent-id isolated across scoped sessions and stateless accounts, got %v", seenAgentIDs)
+	}
+	for _, rawID := range seenAgentIDs {
+		parsed, err := uuid.Parse(rawID)
+		if err != nil || parsed.Version() != uuid.Version(4) {
+			t.Fatalf("x-grok-agent-id %q is not a valid UUIDv4: err=%v", rawID, err)
+		}
+	}
+}
+
 func TestForwardMessagesCapturesRawUpstreamResponsesBeforeConversion(t *testing.T) {
 	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	if err != nil {

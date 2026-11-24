@@ -2289,16 +2289,19 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 	)
 	toolContinuationBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"},{"type":"reasoning","summary":[],"encrypted_content":"` + validCipher + `"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
 
-	t.Run("single degraded account before thinking account is cooled", func(t *testing.T) {
+	t.Run("single degraded account before thinking account isolates prompt_cache_key and applies full cooldown", func(t *testing.T) {
 		ctx := context.Background()
 		responses := make(map[uint64][]scriptedBuildResponse)
 		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-single-degraded.db", responses)
 		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
-		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
+		responses[credentials[1].ID] = []scriptedBuildResponse{
+			{status: http.StatusOK, body: toolCallWithReasoning},
+			{status: http.StatusOK, body: toolCallWithReasoning},
+		}
 
 		result, err := service.CreateResponse(ctx, Input{
 			RequestID: "req-mt-1", ClientKey: key, PublicModel: "grok-4.7",
-			Streaming: true, Body: toolContinuationBody,
+			PromptCacheSeed: "session-10888", Streaming: true, Body: toolContinuationBody,
 		})
 		if err != nil {
 			t.Fatalf("expected retry onto thinking account, got err=%v", err)
@@ -2309,254 +2312,134 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 		if !strings.Contains(string(body), validCipher) {
 			t.Fatalf("expected thinking response from 2nd account, got %s", body)
 		}
-		if attempts := adapter.Attempts(); len(attempts) != 2 {
+		attempts := adapter.Attempts()
+		if len(attempts) != 2 {
 			t.Fatalf("expected 2 attempts, got %v", attempts)
 		}
-		acct0, _ := accountRepo.Get(ctx, credentials[0].ID)
-		acct1, _ := accountRepo.Get(ctx, credentials[1].ID)
-		if acct0.CooldownUntil == nil || acct0.LastError != lastErrorMissingThinking {
-			t.Fatalf("confirmed degraded account 0 must be cooled after account 1 proved thinking: %#v", acct0)
+		cacheKeys := adapter.PromptCacheKeys()
+		if len(cacheKeys) != 2 || cacheKeys[0] == "" || cacheKeys[1] == "" || cacheKeys[0] == cacheKeys[1] {
+			t.Fatalf("cross-account quality retry must isolate prompt_cache_key per account, got %v", cacheKeys)
 		}
-		if acct1.CooldownUntil != nil {
-			t.Fatalf("healthy thinking account 1 must not be cooled: %#v", acct1)
+		firstTried, _ := accountRepo.Get(ctx, attempts[0])
+		secondTried, _ := accountRepo.Get(ctx, attempts[1])
+		if firstTried.CooldownUntil == nil || firstTried.LastError != lastErrorMissingThinking || time.Until(*firstTried.CooldownUntil) < 11*time.Hour {
+			t.Fatalf("confirmed degraded account %d must receive full cooldown after healthy account delivered thinking: %#v", attempts[0], firstTried)
+		}
+		if secondTried.CooldownUntil != nil {
+			t.Fatalf("healthy thinking account %d must not be cooled: %#v", attempts[1], secondTried)
 		}
 		logs, _, _ := auditRepo.List(ctx, 0, 10)
 		degradedAudits := 0
 		for _, rec := range logs {
-			if rec.ErrorCode == ErrorQualityDegraded && rec.AccountID != nil && *rec.AccountID == credentials[0].ID {
+			if rec.ErrorCode == ErrorQualityDegraded && rec.AccountID != nil && *rec.AccountID == attempts[0] {
 				degradedAudits++
 			}
 		}
 		if degradedAudits != 1 {
-			t.Fatalf("expected exactly 1 quality_degraded audit for account 0, got %d", degradedAudits)
+			t.Fatalf("expected exactly 1 quality_degraded audit for degraded account, got %d", degradedAudits)
 		}
-	})
 
-	t.Run("two-account clean tool-call consensus delivers without cooldown and preserves sticky", func(t *testing.T) {
-		ctx := context.Background()
-		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-tool-consensus.db", responses)
-		// Turn 1 binds sticky session to credentials[0] with valid thinking.
-		responses[credentials[0].ID] = []scriptedBuildResponse{
-			{status: http.StatusOK, body: toolCallWithReasoning},
-			{status: http.StatusOK, body: cleanToolCallNoReasoning},
-			{status: http.StatusOK, body: toolCallWithReasoning},
-		}
-		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
-		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
-
-		firstTurnBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"}]}`)
-		res1, err := service.CreateResponse(ctx, Input{
-			RequestID: "req-turn-1", ClientKey: key, PublicModel: "grok-4.7",
-			PromptCacheSeed: "session-10888", Streaming: true, Body: firstTurnBody,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = io.ReadAll(res1.Body)
-		res1.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
-		_ = res1.Body.Close()
-
-		// Turn 2: both credentials[0] and credentials[1] return clean 0-reasoning function_call.
-		res2, err := service.CreateResponse(ctx, Input{
-			RequestID: "req-turn-2", ClientKey: key, PublicModel: "grok-4.7",
+		// Subsequent turn on the same logical session stays sticky to the healthy
+		// account and reuses the exact same PromptCacheKey for Prompt Cache hits.
+		nextTurn, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-mt-2", ClientKey: key, PublicModel: "grok-4.7",
 			PromptCacheSeed: "session-10888", Streaming: true, Body: toolContinuationBody,
 		})
 		if err != nil {
-			t.Fatalf("2-account tool continuation consensus must deliver instead of 503: %v", err)
+			t.Fatalf("next turn on sticky healthy account failed: %v", err)
 		}
-		body2, _ := io.ReadAll(res2.Body)
-		res2.Finalize(Usage{Reported: true, OutputTokens: 26, ReasoningTokens: 0}, "resp-mt-clean", "")
-		_ = res2.Body.Close()
-		if !strings.Contains(string(body2), `"call_2"`) {
-			t.Fatalf("expected clean tool call delivered, got %s", body2)
+		_, _ = io.ReadAll(nextTurn.Body)
+		nextTurn.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok-2", "")
+		_ = nextTurn.Body.Close()
+		if gotAttempts := adapter.Attempts(); len(gotAttempts) != 3 || gotAttempts[2] != attempts[1] {
+			t.Fatalf("expected next turn to stay sticky on healthy account %d, got %v", attempts[1], gotAttempts)
 		}
-		attempts := adapter.Attempts()
-		if len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[0].ID || attempts[2] != credentials[1].ID {
-			t.Fatalf("expected turn1->acct0 and turn2->acct0,acct1 consensus (not touching acct2), got %v", attempts)
-		}
-		for _, cred := range credentials[:2] {
-			acct, _ := accountRepo.Get(ctx, cred.ID)
-			if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
-				t.Fatalf("consensus account %d must not be cooled down: %#v", cred.ID, acct)
-			}
-		}
-
-		// Turn 3 (new user prompt) should route back to sticky credentials[0].
-		res3, err := service.CreateResponse(ctx, Input{
-			RequestID: "req-turn-3", ClientKey: key, PublicModel: "grok-4.7",
-			PromptCacheSeed: "session-10888", Streaming: true, Body: firstTurnBody,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = io.ReadAll(res3.Body)
-		res3.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
-		_ = res3.Body.Close()
-		if got := adapter.Attempts(); len(got) != 4 || got[3] != credentials[0].ID {
-			t.Fatalf("sticky session should be restored to original healthy account %d, got attempts=%v", credentials[0].ID, got)
+		if gotKeys := adapter.PromptCacheKeys(); len(gotKeys) != 3 || gotKeys[2] != cacheKeys[1] {
+			t.Fatalf("sticky healthy account must reuse exact prompt_cache_key %q, got %v", cacheKeys[1], gotKeys)
 		}
 	})
 
-	t.Run("two-account clean midstream text consensus streams full body without cooldown", func(t *testing.T) {
+	t.Run("multi-account clean 0-reasoning exhaustion rejects under fail_closed with short anti-cascade cooldown", func(t *testing.T) {
 		ctx := context.Background()
 		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-text-consensus.db", responses)
-		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
-		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
-		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
-
-		result, err := service.CreateResponse(ctx, Input{
-			RequestID: "req-mt-text", ClientKey: key, PublicModel: "grok-4.7",
-			Streaming: true, Body: toolContinuationBody,
+		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-anti-cascade.db", responses)
+		service.UpdateQualityRetry(QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 3, MinOutputTokens: 8,
+			AutoDisable: true, AccountCooldown: 24 * time.Hour, IdleAccountCooldown: 15 * time.Minute,
+			OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
 		})
-		if err != nil {
-			t.Fatalf("midstream text consensus must deliver instead of 503: %v", err)
-		}
-		body, _ := io.ReadAll(result.Body)
-		result.Finalize(Usage{Reported: true, OutputTokens: 30, ReasoningTokens: 0}, "resp-mt-text", "")
-		_ = result.Body.Close()
-		if !strings.Contains(string(body), "first chunk of visible continuation text") || !strings.Contains(string(body), "TAIL_CHUNK_DELIVERED") {
-			t.Fatalf("stream replay lost prefix or tail chunks: %s", body)
-		}
-		if attempts := adapter.Attempts(); len(attempts) != 2 {
-			t.Fatalf("expected 2 attempts for midstream text consensus, got %v", attempts)
-		}
-		for _, cred := range credentials[:2] {
-			acct, _ := accountRepo.Get(ctx, cred.ID)
-			if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
-				t.Fatalf("consensus account %d must not be cooled: %#v", cred.ID, acct)
-			}
-		}
-	})
-
-	t.Run("multi-turn ending with new user prompt enforces strict withhold", func(t *testing.T) {
-		ctx := context.Background()
-		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-user-tail.db", responses)
 		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
-		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
-		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
+		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
+		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
 
-		userTailBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"},{"type":"message","role":"user","content":"now explain everything"}]}`)
-		result, err := service.CreateResponse(ctx, Input{
-			RequestID: "req-mt-user-tail", ClientKey: key, PublicModel: "grok-4.7",
-			Streaming: true, Body: userTailBody,
+		_, err := service.CreateResponse(ctx, Input{
+			RequestID: "req-mt-exhaust", ClientKey: key, PublicModel: "grok-4.7",
+			PromptCacheSeed: "session-exhaust", Streaming: true, Body: toolContinuationBody,
 		})
-		if err != nil {
-			t.Fatalf("expected 3rd thinking account to deliver, got err=%v", err)
-		}
-		body, _ := io.ReadAll(result.Body)
-		result.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
-		_ = result.Body.Close()
-		if !strings.Contains(string(body), validCipher) {
-			t.Fatalf("expected thinking response from 3rd account, got %s", body)
+		var failure *UpstreamFailure
+		if !errors.As(err, &failure) || failure.HTTPStatus != http.StatusServiceUnavailable || failure.Code != ErrorQualityDegraded {
+			t.Fatalf("fail_closed must strictly reject 0-reasoning exhaustion with 503 quality_degraded, got err=%v", err)
 		}
 		if attempts := adapter.Attempts(); len(attempts) != 3 {
-			t.Fatalf("new user prompt must not form 0-reasoning consensus, got attempts=%v", attempts)
+			t.Fatalf("expected all 3 isolated accounts to be tried, got %v", attempts)
 		}
-		for _, cred := range credentials[:2] {
+		keys := adapter.PromptCacheKeys()
+		if len(keys) != 3 || keys[0] == keys[1] || keys[1] == keys[2] || keys[0] == keys[2] {
+			t.Fatalf("expected 3 distinct per-account prompt_cache_keys, got %v", keys)
+		}
+		for _, cred := range credentials {
 			acct, _ := accountRepo.Get(ctx, cred.ID)
-			if acct.CooldownUntil == nil || acct.LastError != lastErrorMissingThinking {
-				t.Fatalf("degraded account %d on user prompt must be cooled: %#v", cred.ID, acct)
+			if !acct.Enabled {
+				t.Fatalf("multi-account clean exhaustion must not auto-disable account %d: %#v", cred.ID, acct)
 			}
+			if acct.CooldownUntil == nil {
+				t.Fatalf("account %d must receive short cooldown: %#v", cred.ID, acct)
+			}
+			remaining := time.Until(*acct.CooldownUntil)
+			if remaining > 16*time.Minute || remaining < 10*time.Minute {
+				t.Fatalf("expected ~15m short anti-cascade cooldown for account %d, got %s", cred.ID, remaining)
+			}
+		}
+		logs, _, _ := auditRepo.List(ctx, 0, 10)
+		degradedAudits := 0
+		for _, rec := range logs {
+			if rec.StatusCode == http.StatusOK && rec.ErrorCode == ErrorQualityDegraded {
+				degradedAudits++
+			}
+		}
+		if degradedAudits != 3 {
+			t.Fatalf("expected 3 quality_degraded attempt audits, got %d", degradedAudits)
 		}
 	})
 
-	t.Run("malformed stub 0-reasoning on tool continuation never forms consensus", func(t *testing.T) {
+	t.Run("malformed stub 0-reasoning exhaustion still applies full auto-disable penalty", func(t *testing.T) {
 		ctx := context.Background()
 		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-stub-no-consensus.db", responses)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-stub-disable.db", responses)
+		service.UpdateQualityRetry(QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
+			AutoDisable: true, AccountCooldown: 24 * time.Hour, IdleAccountCooldown: 15 * time.Minute,
+			OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
+		})
 		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: stubNoReasoning}}
 		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: stubNoReasoning}}
 		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
 
-		result, err := service.CreateResponse(ctx, Input{
+		_, err := service.CreateResponse(ctx, Input{
 			RequestID: "req-mt-stub", ClientKey: key, PublicModel: "grok-4.7",
 			Streaming: true, Body: toolContinuationBody,
 		})
-		if err != nil {
-			t.Fatalf("expected retry past 2 malformed stubs onto 3rd thinking account, got err=%v", err)
+		if err == nil {
+			t.Fatal("expected 503 after MaxAttempts=2 malformed stubs")
 		}
-		body, _ := io.ReadAll(result.Body)
-		result.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
-		_ = result.Body.Close()
-		if !strings.Contains(string(body), validCipher) {
-			t.Fatalf("expected thinking response from 3rd account, got %s", body)
+		attempts := adapter.Attempts()
+		if len(attempts) != 2 {
+			t.Fatalf("expected 2 attempts, got %v", attempts)
 		}
-		if attempts := adapter.Attempts(); len(attempts) != 3 {
-			t.Fatalf("malformed stubs must not form consensus, got attempts=%v", attempts)
-		}
-		for _, cred := range credentials[:2] {
-			acct, _ := accountRepo.Get(ctx, cred.ID)
-			if acct.CooldownUntil == nil || acct.LastError != lastErrorMissingThinking {
-				t.Fatalf("stub-emitting degraded account %d must be cooled: %#v", cred.ID, acct)
-			}
-		}
-	})
-
-	t.Run("grok build cli environment_context after function_call_output uses two-account consensus", func(t *testing.T) {
-		ctx := context.Background()
-		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-env-context.db", responses)
-		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
-		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
-		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: toolCallWithReasoning}}
-
-		envTailBody := []byte(`{"model":"grok-4.7","stream":true,"tools":[{"type":"function","name":"shell"}],"input":[{"type":"message","role":"user","content":"check dir"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"},{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/app</cwd>\n</environment_context>"}]}]}`)
-		result, err := service.CreateResponse(ctx, Input{
-			RequestID: "req-mt-env-tail", ClientKey: key, PublicModel: "grok-4.7",
-			Streaming: true, Body: envTailBody,
-		})
-		if err != nil {
-			t.Fatalf("expected 2-account consensus delivery, got err=%v", err)
-		}
-		body, _ := io.ReadAll(result.Body)
-		result.Finalize(Usage{Reported: true, OutputTokens: 26, ReasoningTokens: 0}, "resp-mt-clean", "")
-		_ = result.Body.Close()
-		if !strings.Contains(string(body), `"call_2"`) {
-			t.Fatalf("expected clean tool call delivered, got %s", body)
-		}
-		if attempts := adapter.Attempts(); len(attempts) != 2 {
-			t.Fatalf("expected 2 attempts for environment_context tail consensus, got %v", attempts)
-		}
-		for _, cred := range credentials[:2] {
-			acct, _ := accountRepo.Get(ctx, cred.ID)
-			if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
-				t.Fatalf("consensus account %d must not be cooled: %#v", cred.ID, acct)
-			}
-		}
-	})
-
-	t.Run("active tool session user confirmation reaches three-account consensus without mass cooldown", func(t *testing.T) {
-		ctx := context.Background()
-		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-tool-session-3acct.db", responses)
-		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
-		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
-		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
-
-		userConfirmInToolSession := []byte(`{"model":"grok-4.7","stream":true,"tools":[{"type":"function","name":"shell"}],"input":[{"type":"message","role":"user","content":"fix bug"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"git status\"}"},{"type":"function_call_output","call_id":"call_1","output":"clean"},{"type":"message","role":"user","content":[{"type":"input_text","text":"推"}]}]}`)
-		result, err := service.CreateResponse(ctx, Input{
-			RequestID: "req-mt-3acct", ClientKey: key, PublicModel: "grok-4.7",
-			Streaming: true, Body: userConfirmInToolSession,
-		})
-		if err != nil {
-			t.Fatalf("expected 3-account consensus delivery instead of 503 cascade, got err=%v", err)
-		}
-		body, _ := io.ReadAll(result.Body)
-		result.Finalize(Usage{Reported: true, OutputTokens: 26, ReasoningTokens: 0}, "resp-mt-clean", "")
-		_ = result.Body.Close()
-		if !strings.Contains(string(body), `"call_2"`) {
-			t.Fatalf("expected 3rd account clean tool call delivered, got %s", body)
-		}
-		if attempts := adapter.Attempts(); len(attempts) != 3 {
-			t.Fatalf("expected 3 attempts for user-tail tool-session consensus, got %v", attempts)
-		}
-		for _, cred := range credentials {
-			acct, _ := accountRepo.Get(ctx, cred.ID)
-			if acct.CooldownUntil != nil || acct.LastError == lastErrorMissingThinking {
-				t.Fatalf("account %d must not be mass-cooled when 3 independent accounts agree on 0-reasoning: %#v", cred.ID, acct)
+		for _, id := range attempts {
+			acct, _ := accountRepo.Get(ctx, id)
+			if acct.Enabled || acct.LastError != lastErrorMissingThinkingDisabled {
+				t.Fatalf("malformed stub account %d must still be auto-disabled: %#v", id, acct)
 			}
 		}
 	})

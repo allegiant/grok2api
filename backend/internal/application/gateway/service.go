@@ -972,7 +972,8 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		return nil, clientkeyapp.ErrModelNotAllowed
 	}
 	affinityKey := ""
-	ownershipPromptCacheKey := ""
+	basePromptCacheKey := ""
+	inheritedOwnershipPromptCacheKey := ""
 	reasoningReplayKey := ""
 	if route.Provider == accountdomain.ProviderBuild {
 		// Derive a stable identity from explicit session signals, message anchors,
@@ -984,6 +985,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			// do not recompute the soft key from this turn's incremental input.
 			identity.upstreamID = ownership.PromptCacheKey
 			identity.replayKey = ownership.ReasoningReplayKey
+			inheritedOwnershipPromptCacheKey = ownership.PromptCacheKey
 		} else {
 			identity = resolveBuildSessionIdentity(
 				input.ClientKey.ID,
@@ -995,9 +997,9 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			)
 		}
 		identity = ensureBuildComposerSessionIdentity(identity, input.ClientKey.ID, route.Provider, route.UpstreamModel, requestSessionScope)
-		input.PromptCacheKey = identity.upstreamID
+		basePromptCacheKey = identity.upstreamID
+		input.PromptCacheKey = basePromptCacheKey
 		affinityKey = identity.affinityKey
-		ownershipPromptCacheKey = identity.upstreamID
 		reasoningReplayKey = identity.replayKey
 		if identity.upstreamID == "" {
 			s.logger.Debug("prompt_cache_session_empty", "request_id", input.RequestID, "model", route.UpstreamModel, "provider", route.Provider)
@@ -1006,6 +1008,21 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		} else if identity.isolated {
 			s.logger.Debug("prompt_cache_session_isolated", "request_id", input.RequestID, "model", route.UpstreamModel)
 		}
+	}
+	ownershipPromptCacheKeyForAccount := func(accountID uint64) string {
+		if route.Provider != accountdomain.ProviderBuild {
+			return ""
+		}
+		if inheritedOwnershipPromptCacheKey != "" {
+			return inheritedOwnershipPromptCacheKey
+		}
+		return scopeBuildPromptCacheKeyForAccount(basePromptCacheKey, accountID)
+	}
+	forwardPromptCacheKey := func(accountID uint64) string {
+		if route.Provider != accountdomain.ProviderBuild {
+			return input.PromptCacheKey
+		}
+		return ownershipPromptCacheKeyForAccount(accountID)
 	}
 	adapter, ok := s.providers.Responses(route.Provider)
 	if !ok {
@@ -1060,7 +1077,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		if qualityDiagnostic != nil {
 			qualityDiagnostic.ResetUpstreamAttempt()
 		}
-		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, TransientRetry: transientRetry, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata, QualityDiagnostic: qualityDiagnostic})
+		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: forwardPromptCacheKey(credential.ID), ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, TransientRetry: transientRetry, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata, QualityDiagnostic: qualityDiagnostic})
 		auditBase.ReasoningEffort = normalizedMetadata.ReasoningEffort
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
@@ -1073,7 +1090,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		timing.markCredential(time.Since(started))
 		return result, err
 	}
-	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, missingThinkingPenalized bool) *Result {
+	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, missingThinkingPenalized, skipSpeedAutoDisable bool) *Result {
 		accountID := credential.ID
 		var once sync.Once
 		finalize := func(usage Usage, responseID, errorCode string) {
@@ -1138,7 +1155,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				}
 				record.CreatedAt = now
 				applyAuditEgress(&record, egressTrace, route.Provider)
-				if !missingThinkingPenalized || holdCfg.AutoDisable {
+				if (!missingThinkingPenalized || holdCfg.AutoDisable) && !skipSpeedAutoDisable {
 					if err := budget.run("quality_disable", finalizationHealthBudget, func(stageCtx context.Context) error {
 						return s.applyOutputSpeedPenalty(stageCtx, record, credential, holdCfg, input.ForcedEgressNodeID != 0)
 					}); err != nil {
@@ -1147,7 +1164,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				}
 				if supportsStoredResponses && operation == audit.OperationResponses && responseID != "" && successful {
 					err := budget.run("response_ownership", finalizationOwnershipBudget, func(stageCtx context.Context) error {
-						return s.responses.Save(stageCtx, inferencedomain.ResponseOwnership{ResponseID: responseID, AccountID: accountID, ClientKeyID: input.ClientKey.ID, ModelRouteID: route.ID, Provider: route.Provider, PromptCacheKey: ownershipPromptCacheKey, ReasoningReplayKey: reasoningReplayKey, ExpiresAt: now.Add(responseOwnershipTTL), CreatedAt: now, UpdatedAt: now})
+						return s.responses.Save(stageCtx, inferencedomain.ResponseOwnership{ResponseID: responseID, AccountID: accountID, ClientKeyID: input.ClientKey.ID, ModelRouteID: route.ID, Provider: route.Provider, PromptCacheKey: ownershipPromptCacheKeyForAccount(accountID), ReasoningReplayKey: reasoningReplayKey, ExpiresAt: now.Add(responseOwnershipTTL), CreatedAt: now, UpdatedAt: now})
 					})
 					if err != nil {
 						s.logger.Error("response_ownership_save_failed", "response_id", responseID, "client_key_id", input.ClientKey.ID, "account_id", accountID, "provider", route.Provider, "error", err)
@@ -1202,19 +1219,18 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		timingHandedOff = true
 		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, MarkFirstToken: markFirstToken, RecordStreamFailure: recordStreamFailure, Finalize: finalize}
 	}
-	// fail_open (and uncontradicted clean tool-result continuations) retains at
-	// most one successful no-thinking stream. The account lease is released
-	// immediately; the read pump applies upstream backpressure until this
-	// response is either delivered or replaced by a better one.
+	// fail_open retains at most one successful no-thinking stream. The account
+	// lease is released immediately; the read pump applies upstream backpressure
+	// until this response is either delivered or replaced by a better one.
 	type qualityFallback struct {
-		response                *provider.Response
-		lease                   *accountLease
-		credential              accountdomain.Credential
-		usage                   Usage
-		upstreamStartedAt       time.Time
-		auditOnDiscard          bool
-		penalized               bool
-		allowExhaustionFallback bool
+		response             *provider.Response
+		lease                *accountLease
+		credential           accountdomain.Credential
+		usage                Usage
+		upstreamStartedAt    time.Time
+		auditOnDiscard       bool
+		penalized            bool
+		skipSpeedAutoDisable bool
 	}
 	var fallback *qualityFallback
 	discardFallback := func(recordDegraded bool) {
@@ -1230,47 +1246,49 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		fallback = nil
 	}
 	reqContinuation := inspectQualityRequestContinuation(input.Body)
-	zeroReasoningConsensusThreshold := 0
-	if qualityHoldEnabled && qualityCrossAccountReplay {
-		if reqContinuation.IsToolContinuation {
-			zeroReasoningConsensusThreshold = 2
-		} else if reqContinuation.HasToolLoopContext {
-			zeroReasoningConsensusThreshold = 3
-		}
-	}
-	allowUncontradictedFallback := reqContinuation.IsToolContinuation
 	type deferredQualityPenalty struct {
 		credential        accountdomain.Credential
 		usage             Usage
 		upstreamStartedAt time.Time
 	}
-	var deferredPenalties []deferredQualityPenalty
-	flushDeferredPenalties := func(skipAuditAccountID uint64) {
-		for _, pending := range deferredPenalties {
-			s.applyMissingThinkingPenalty(ctx, input.RequestID, pending.credential, holdCfg.AccountCooldown, holdCfg.AutoDisable)
+	var deferredCleanPenalties []deferredQualityPenalty
+	// When >= 2 isolated accounts in the same request return clean 0-reasoning
+	// streams and no account delivers thinking, apply a short cooldown without
+	// auto-disabling so systemic upstream degradation cannot lock out the pool.
+	cleanPenaltyParams := func(totalClean int) (time.Duration, bool, bool) {
+		if totalClean >= 2 {
+			shortCooldown := holdCfg.AccountCooldown
+			if holdCfg.IdleAccountCooldown > 0 && (shortCooldown <= 0 || holdCfg.IdleAccountCooldown < shortCooldown) {
+				shortCooldown = holdCfg.IdleAccountCooldown
+			}
+			return shortCooldown, false, true
+		}
+		return holdCfg.AccountCooldown, holdCfg.AutoDisable, false
+	}
+	flushDeferredCleanPenalties := func(cooldown time.Duration, autoDisable bool, skipAuditAccountID uint64) {
+		for _, pending := range deferredCleanPenalties {
+			s.applyMissingThinkingPenalty(ctx, input.RequestID, pending.credential, cooldown, autoDisable)
 			if pending.credential.ID != skipAuditAccountID {
 				s.recordQualityDegraded(ctx, auditBase, pending.credential, pending.usage, pending.upstreamStartedAt, egressTrace, route.Provider)
 				failureAttempts.captureQualityDegraded(pending.credential, pending.upstreamStartedAt)
 			}
 		}
-		deferredPenalties = nil
+		deferredCleanPenalties = nil
 	}
-	var initialStickyAccountID uint64
-	stickyKey := stickySessionKey(affinityKey)
-	if zeroReasoningConsensusThreshold > 0 && stickyKey != "" && s.selector != nil && s.selector.sticky != nil {
-		if boundID, ok, stickyErr := s.selector.sticky.Get(ctx, stickyKey, time.Now().UTC()); stickyErr == nil && ok {
-			initialStickyAccountID = boundID
+	handoffFallback := func() *Result {
+		selected := fallback
+		fallback = nil
+		if len(deferredCleanPenalties) > 0 {
+			cooldown, autoDisable, shortPenalty := cleanPenaltyParams(len(deferredCleanPenalties))
+			flushDeferredCleanPenalties(cooldown, autoDisable, selected.credential.ID)
+			if !selected.penalized {
+				selected.penalized = true
+				selected.skipSpeedAutoDisable = shortPenalty
+			}
 		}
+		s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
+		return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, selected.penalized, selected.skipSpeedAutoDisable)
 	}
-	restoreInitialSticky := func(cleanAccountID uint64) {
-		if initialStickyAccountID == 0 || initialStickyAccountID != cleanAccountID || stickyKey == "" || s.selector == nil || s.selector.sticky == nil {
-			return
-		}
-		stickyTTL, _, _, _ := s.selector.routingConfig()
-		_ = s.selector.sticky.Set(ctx, stickyKey, initialStickyAccountID, time.Now().UTC().Add(stickyTTL))
-	}
-	var firstCleanContinuationAccountID uint64
-	toolContinuationCleanWithholds := 0
 attemptLoop:
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 		if qualityHoldEnabled && qualityAccountAttempts >= holdCfg.MaxAttempts {
@@ -1678,6 +1696,7 @@ attemptLoop:
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			missingThinkingPenalized := false
+			skipSpeedAutoDisable := false
 			if qualityHoldEnabled {
 				replay, verdict, peekUsage, peekMetadata, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
 				if peekErr != nil {
@@ -1722,25 +1741,9 @@ attemptLoop:
 					hasNextAccount = selection != nil && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
 				}
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
-				toolContinuationConsensus := false
-				deferToolContinuationPenalty := false
-				if zeroReasoningConsensusThreshold > 0 && verdict == QualityWithhold && peekMetadata.CleanZeroReasoningContinuation {
-					toolContinuationCleanWithholds++
-					if firstCleanContinuationAccountID == 0 {
-						firstCleanContinuationAccountID = credential.ID
-					}
-					if toolContinuationCleanWithholds >= zeroReasoningConsensusThreshold {
-						toolContinuationConsensus = true
-						deferredPenalties = nil
-						discardFallback(false)
-						restoreInitialSticky(firstCleanContinuationAccountID)
-						commit = QualityCommit{Action: QualityActionDeliverLast, Audit: false, KeepBody: true}
-					} else if commit.Action == QualityActionRetry {
-						deferToolContinuationPenalty = true
-					}
-				}
-				if verdict == QualityDeliver && len(deferredPenalties) > 0 {
-					flushDeferredPenalties(0)
+				deferCleanPenalty := qualityCrossAccountReplay && verdict == QualityWithhold && peekMetadata.CleanZeroReasoningContinuation && commit.Action == QualityActionRetry
+				if verdict == QualityDeliver && len(deferredCleanPenalties) > 0 {
+					flushDeferredCleanPenalties(holdCfg.AccountCooldown, holdCfg.AutoDisable, 0)
 				}
 				incomingShape := provider.RequestShapeSummary{}
 				upstreamShape := provider.RequestShapeSummary{}
@@ -1751,7 +1754,7 @@ attemptLoop:
 					historyIntegrity = qualityDiagnostic.ResponsesHistoryIntegritySnapshot()
 				}
 				s.logQualityStreamObserved(input.RequestID, credential.ID, route, operation, verdict, commit.Action, qualityAccountAttempts, peekUsage, peekMetadata.Stream, incomingShape, upstreamShape, rawUpstreamResponse, historyIntegrity, reqContinuation)
-				if verdict == QualityWithhold && !toolContinuationConsensus {
+				if verdict == QualityWithhold {
 					s.logger.Info("quality_degraded_diagnostic",
 						"request_id", input.RequestID,
 						"account_id", credential.ID,
@@ -1765,38 +1768,48 @@ attemptLoop:
 						"output_tokens", peekUsage.OutputTokens,
 						"reasoning_tokens", peekUsage.ReasoningTokens,
 					)
-					if deferToolContinuationPenalty {
-						deferredPenalties = append(deferredPenalties, deferredQualityPenalty{
+					if deferCleanPenalty {
+						deferredCleanPenalties = append(deferredCleanPenalties, deferredQualityPenalty{
 							credential:        credential,
 							usage:             peekUsage,
 							upstreamStartedAt: responseStartedAt,
 						})
 					} else {
-						s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown, holdCfg.AutoDisable)
+						totalClean := len(deferredCleanPenalties)
+						if peekMetadata.CleanZeroReasoningContinuation {
+							totalClean++
+						}
+						if len(deferredCleanPenalties) > 0 {
+							deferredCooldown, deferredAutoDisable, _ := cleanPenaltyParams(totalClean)
+							flushDeferredCleanPenalties(deferredCooldown, deferredAutoDisable, 0)
+						}
+						penaltyCooldown, penaltyAutoDisable := holdCfg.AccountCooldown, holdCfg.AutoDisable
+						if peekMetadata.CleanZeroReasoningContinuation {
+							penaltyCooldown, penaltyAutoDisable, skipSpeedAutoDisable = cleanPenaltyParams(totalClean)
+						}
+						s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, penaltyCooldown, penaltyAutoDisable)
 						missingThinkingPenalized = true
 					}
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
-				if commit.Audit && !deferFailOpenAudit && !deferToolContinuationPenalty {
+				if commit.Audit && !deferFailOpenAudit && !deferCleanPenalty {
 					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, responseStartedAt, egressTrace, route.Provider)
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
-				} else if verdict == QualityWithhold && commit.Action == QualityActionDeliverLast && !toolContinuationConsensus {
+				} else if verdict == QualityWithhold && commit.Action == QualityActionDeliverLast {
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
 				}
 				switch commit.Action {
 				case QualityActionRetry:
-					retainUncontradictedFallback := deferToolContinuationPenalty && allowUncontradictedFallback
-					if deferFailOpenAudit || retainUncontradictedFallback {
+					if deferFailOpenAudit {
 						discardFallback(true)
 						fallback = &qualityFallback{
-							response:                response,
-							lease:                   lease,
-							credential:              credential,
-							usage:                   peekUsage,
-							upstreamStartedAt:       responseStartedAt,
-							auditOnDiscard:          !deferToolContinuationPenalty,
-							penalized:               !deferToolContinuationPenalty,
-							allowExhaustionFallback: holdCfg.OnExhausted == qualityRetryFailOpen || retainUncontradictedFallback,
+							response:          response,
+							lease:             lease,
+							credential:        credential,
+							usage:             peekUsage,
+							upstreamStartedAt: responseStartedAt,
+							auditOnDiscard:    !deferCleanPenalty,
+							penalized:         !deferCleanPenalty,
 						}
 						lease.completeSelectorObservation(true)
 						lease.Release()
@@ -1814,9 +1827,6 @@ attemptLoop:
 					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "reasoning_tokens", peekUsage.ReasoningTokens)
 					continue
 				case QualityActionReject:
-					if !allowUncontradictedFallback && len(deferredPenalties) > 0 {
-						flushDeferredPenalties(0)
-					}
 					reasoningreplay.DiscardCapture(response.Body)
 					_ = response.Body.Close()
 					lease.Release()
@@ -1830,14 +1840,7 @@ attemptLoop:
 					break attemptLoop
 				case QualityActionDeliverLast:
 					discardFallback(true)
-					if toolContinuationConsensus {
-						s.logger.Info("quality_tool_continuation_consensus", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "consensus_threshold", zeroReasoningConsensusThreshold, "output_tokens", peekUsage.OutputTokens)
-					} else {
-						if !allowUncontradictedFallback && len(deferredPenalties) > 0 {
-							flushDeferredPenalties(0)
-						}
-						s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "reasoning_tokens", peekUsage.ReasoningTokens)
-					}
+					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "reasoning_tokens", peekUsage.ReasoningTokens)
 				case QualityActionDeliver:
 					discardFallback(true)
 				}
@@ -1857,59 +1860,33 @@ attemptLoop:
 					}
 				}
 			}
-			if fallback != nil && fallback.allowExhaustionFallback {
+			if fallback != nil {
 				reasoningreplay.DiscardCapture(response.Body)
 				_ = response.Body.Close()
 				lease.completeSelectorObservation(false)
 				lease.Release()
-				selected := fallback
-				fallback = nil
-				if !allowUncontradictedFallback && len(deferredPenalties) > 0 {
-					flushDeferredPenalties(selected.credential.ID)
-					selected.penalized = true
-				} else if !selected.penalized {
-					restoreInitialSticky(selected.credential.ID)
-				}
-				s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
-				return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, selected.penalized), nil
+				return handoffFallback(), nil
 			}
-			return handoffResponse(response, lease, credential, responseStartedAt, missingThinkingPenalized), nil
+			return handoffResponse(response, lease, credential, responseStartedAt, missingThinkingPenalized, skipSpeedAutoDisable), nil
 		}
-		if fallback != nil && fallback.allowExhaustionFallback {
+		if fallback != nil {
 			reasoningreplay.DiscardCapture(response.Body)
 			_ = response.Body.Close()
 			lease.completeSelectorObservation(false)
 			lease.Release()
-			selected := fallback
-			fallback = nil
-			if !allowUncontradictedFallback && len(deferredPenalties) > 0 {
-				flushDeferredPenalties(selected.credential.ID)
-				selected.penalized = true
-			} else if !selected.penalized {
-				restoreInitialSticky(selected.credential.ID)
-			}
-			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, selected.penalized), nil
+			return handoffFallback(), nil
 		}
-		return handoffResponse(response, lease, credential, responseStartedAt, false), nil
+		return handoffResponse(response, lease, credential, responseStartedAt, false, false), nil
 	}
 	if fallback != nil {
-		if ctx.Err() == nil && fallback.allowExhaustionFallback {
-			selected := fallback
-			fallback = nil
-			if !allowUncontradictedFallback && len(deferredPenalties) > 0 {
-				flushDeferredPenalties(selected.credential.ID)
-				selected.penalized = true
-			} else if !selected.penalized {
-				restoreInitialSticky(selected.credential.ID)
-			}
-			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, selected.penalized), nil
+		if ctx.Err() == nil {
+			return handoffFallback(), nil
 		}
 		discardFallback(true)
 	}
-	if !allowUncontradictedFallback && len(deferredPenalties) > 0 && ctx.Err() == nil {
-		flushDeferredPenalties(0)
+	if len(deferredCleanPenalties) > 0 && ctx.Err() == nil {
+		cooldown, autoDisable, _ := cleanPenaltyParams(len(deferredCleanPenalties))
+		flushDeferredCleanPenalties(cooldown, autoDisable, 0)
 	}
 	if lastFailure != nil {
 		record := auditBase

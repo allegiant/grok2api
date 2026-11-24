@@ -1138,7 +1138,7 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 			return err
 		}
 		req.Header.Set("x-authenticateresponse", "authenticate-response")
-		req.Header.Set("x-grok-agent-id", a.agentID)
+		req.Header.Set("x-grok-agent-id", a.agentIDForSession(sessionID, credential))
 		if sessionID != "" {
 			req.Header.Set("x-grok-session-id", sessionID)
 			req.Header.Set("x-grok-conv-id", sessionID)
@@ -1176,6 +1176,28 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 		req.Header.Set("x-grok-model-override", model)
 	}
 	return nil
+}
+
+// agentIDForSession derives a deterministic RFC 4122 UUIDv4 per upstream
+// session (or per credential when no session key exists). Because gateway
+// scopes Build PromptCacheKey by account, cross-account retries receive both a
+// fresh x-grok-session-id and a fresh x-grok-agent-id while keeping adapter
+// session headers purely conversation-scoped.
+func (a *Adapter) agentIDForSession(sessionID string, credential account.Credential) string {
+	var scope string
+	if sessionID != "" {
+		scope = "session:" + sessionID
+	} else if credential.ID != 0 {
+		scope = "account:" + strconv.FormatUint(credential.ID, 10)
+	} else {
+		return a.agentID
+	}
+	sum := sha256.Sum256([]byte("grok2api:build-agent:v1:" + a.agentID + ":" + scope))
+	var id uuid.UUID
+	copy(id[:], sum[:16])
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	return id.String()
 }
 
 // grokSessionID converts a stable session key to the upstream x-grok-conv-id.

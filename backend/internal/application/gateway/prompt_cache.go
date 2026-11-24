@@ -96,6 +96,20 @@ func ensureBuildComposerSessionIdentity(identity buildSessionIdentity, clientKey
 	return identity
 }
 
+// scopeBuildPromptCacheKeyForAccount isolates the upstream session ID
+// (prompt_cache_key / x-grok-session-id / x-grok-conv-id) per OAuth account.
+// Normal sticky turns stay on the same account and keep the exact same
+// upstream session ID (preserving 99%+ Prompt Cache hit rates), while cross-account
+// failover or quality retries get a fresh upstream session ID so xAI Build
+// does not route the new account back to a degraded sticky session shard.
+func scopeBuildPromptCacheKeyForAccount(upstreamID string, accountID uint64) string {
+	trimmed := strings.TrimSpace(upstreamID)
+	if trimmed == "" || accountID == 0 {
+		return trimmed
+	}
+	return digestUUID(fmt.Sprintf("grok2api:build-account-session:%s:%d:%s", buildSessionIdentityVersion, accountID, trimmed))
+}
+
 func digestUUID(source string) string {
 	digest := sha256.Sum256([]byte(source))
 	hexID := hex.EncodeToString(digest[:16])
