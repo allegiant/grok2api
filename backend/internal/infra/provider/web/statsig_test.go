@@ -427,6 +427,32 @@ func TestApplySignedStatsigNeverLeavesRandomFallback(t *testing.T) {
 	}
 }
 
+func TestStatsigSignerBacksOffConsecutiveFailures(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	current := now
+	signer := newStatsigSigner()
+	signer.now = func() time.Time { return current }
+	calls := 0
+	signer.fetchMeta = func(context.Context, string, string, *infraegress.Lease) (string, error) {
+		calls++
+		return "", errors.New("signer unavailable")
+	}
+	_, _, err := signer.Sign(context.Background(), "https://grok.com", "https://signer.example/sign", "token", nil, http.MethodPost, "https://grok.com/rest/test")
+	if err == nil || calls != 1 {
+		t.Fatalf("first err=%v calls=%d", err, calls)
+	}
+	current = now.Add(time.Second)
+	_, _, err = signer.Sign(context.Background(), "https://grok.com", "https://signer.example/sign", "token", nil, http.MethodPost, "https://grok.com/rest/test")
+	if !errors.Is(err, errStatsigCooldown) || calls != 1 {
+		t.Fatalf("cooldown err=%v calls=%d", err, calls)
+	}
+	current = now.Add(statsigFailureBackoffBase + time.Second)
+	_, _, err = signer.Sign(context.Background(), "https://grok.com", "https://signer.example/sign", "token", nil, http.MethodPost, "https://grok.com/rest/test")
+	if err == nil || calls != 2 {
+		t.Fatalf("retry err=%v calls=%d", err, calls)
+	}
+}
+
 func TestStatsigInvalidationOnlyAppliesToURLMode(t *testing.T) {
 	manual := &Adapter{cfg: Config{StatsigMode: "manual"}, statsig: newStatsigSigner()}
 	if manual.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {

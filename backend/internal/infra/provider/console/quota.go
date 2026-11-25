@@ -59,9 +59,10 @@ func (a *Adapter) syncConsoleQuotas(ctx context.Context, credential account.Cred
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, consoleQuotaTimeout)
 	defer cancel()
-	// The dashboard is served by grok.com, so it shares the Web scope's exit,
-	// browser fingerprint and Clearance, exactly like the Session identity sync.
-	lease, err := a.egress.AcquireCredential(requestCtx, egressdomain.ScopeWeb, credential)
+	// The dashboard is served by grok.com and keeps the Web browser fingerprint
+	// and Clearance. Ask for the Console scope so a dedicated grok_console node
+	// can serve the account, while a shared grok_web node remains a valid fallback.
+	lease, err := a.egress.AcquireCredential(requestCtx, egressdomain.ScopeConsole, credential)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -79,12 +80,12 @@ func (a *Adapter) syncConsoleQuotas(ctx context.Context, credential account.Cred
 			return nil, time.Time{}, &egressBlockedError{retryAfter: delay}
 		}
 		if !errors.Is(err, provider.ErrUnauthorized) {
-			a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeWeb, lease.NodeID, 0, err)
+			a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, 0, err)
 		}
 		return nil, time.Time{}, err
 	}
 	a.breaker.reset(lease.NodeID)
-	a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeWeb, lease.NodeID, http.StatusOK, nil)
+	a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, http.StatusOK, nil)
 	now := time.Now().UTC()
 	return consoleQuotaWindows(credential.ID, usage, now), now, nil
 }

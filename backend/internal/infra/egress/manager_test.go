@@ -1130,7 +1130,7 @@ func TestAcquireCredentialDoesNotRouteDirectWhenBoundNodeHasNoProxy(t *testing.T
 	_, err = manager.AcquireCredential(context.Background(), domain.ScopeBuild, accountdomain.Credential{
 		ID: 42, Provider: accountdomain.ProviderBuild, EgressNodeID: 2,
 	})
-	if err == nil || !strings.Contains(err.Error(), "未配置代理地址") {
+	if err == nil || !strings.Contains(err.Error(), "未配置代理地址") || !errors.Is(err, domain.ErrBoundNodeUnavailable) {
 		t.Fatalf("bound node without proxy error = %v", err)
 	}
 }
@@ -1147,7 +1147,7 @@ func TestAcquireCredentialDoesNotFallbackWhenBoundNodeIsUnavailable(t *testing.T
 	_, err = manager.AcquireCredential(context.Background(), domain.ScopeBuild, accountdomain.Credential{
 		ID: 42, Provider: accountdomain.ProviderBuild, EgressNodeID: 2,
 	})
-	if err == nil || !strings.Contains(err.Error(), "已禁用") {
+	if err == nil || !strings.Contains(err.Error(), "已禁用") || !errors.Is(err, domain.ErrBoundNodeUnavailable) {
 		t.Fatalf("bound unavailable error = %v", err)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
@@ -1322,6 +1323,45 @@ func (a *imagineQuotaGroupAdapter) SyncQuotaGroup(_ context.Context, credential 
 			WindowSeconds: 86400, SyncedAt: &now, Source: accountdomain.QuotaSourceUpstream, UpdatedAt: now,
 		}},
 	}, nil
+}
+
+func TestQuotaRefreshDropsPermanentBoundNodeError(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quota-refresh-permanent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderConsole, AuthType: accountdomain.AuthTypeSSO,
+		Name: "perm-console", SourceKey: "perm-console", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &rateLimitConsoleQuotaAdapter{err: fmt.Errorf("%w: incompatible scope", egressdomain.ErrBoundNodeUnavailable)}
+	service := NewService(accounts, nil, nil, nil, provider.NewRegistry(adapter), nil, nil)
+	service.QueueQuotaRefresh(credential.ID, "console")
+	request := <-service.quotaRefreshQueue
+	service.quotaRefreshMu.Lock()
+	state := service.quotaRefreshes[request.key]
+	state.queued = false
+	state.running = true
+	service.quotaRefreshMu.Unlock()
+
+	service.runQuotaRefresh(ctx, request)
+
+	service.quotaRefreshMu.Lock()
+	_, exists := service.quotaRefreshes[request.key]
+	service.quotaRefreshMu.Unlock()
+	if exists {
+		t.Fatal("permanent bound-node error stayed in the quota refresh queue")
+	}
 }
 
 type consoleQuotaSnapshotAdapter struct {
