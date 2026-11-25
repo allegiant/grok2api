@@ -1865,6 +1865,11 @@ attemptLoop:
 	if lastErr == nil {
 		lastErr = ErrNoAvailableAccount
 	}
+	// Internal quality probes that never reach an upstream are operator checks,
+	// not client traffic. Keep the error for the probe caller and omit the audit row.
+	if infraegress.QualityProbeFromContext(ctx) {
+		return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastErr)
+	}
 	record := auditBase
 	record.StatusCode = http.StatusServiceUnavailable
 	record.DurationMS = time.Since(startedAt).Milliseconds()

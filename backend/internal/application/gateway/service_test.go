@@ -4244,6 +4244,62 @@ func TestGatewayPinnedDisabledOwnerRecordsSpecific503(t *testing.T) {
 	}
 }
 
+func TestQualityProbeSelectionFailureOmitsRequestAudit(t *testing.T) {
+	ctx := infraegress.WithQualityProbe(context.Background())
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-probe-no-audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	const model = "grok-probe-audit"
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{model}); err != nil {
+		t.Fatal(err)
+	}
+	holder, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "holder", SourceKey: "holder", EncryptedAccessToken: "token",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, holder.ID, []string{model}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "[system] Egress Quality Guard", Prefix: "qualityguard", SecretHash: strings.Repeat("9", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := provider.NewRegistry(&scriptedBuildAdapter{})
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, nil, 3)
+
+	_, err = service.CreateChatCompletion(ctx, Input{
+		RequestID: "quality-probe-pinned-missing", ClientKey: clientKey, PublicModel: model,
+		Body:               []byte(`{"model":"grok-probe-audit","messages":[{"role":"user","content":"probe"}]}`),
+		Streaming:          true, ForcedEgressNodeID: 7, ForcedAccountID: 13088,
+	})
+	var unavailable *SelectionUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Reason != SelectionPinnedUnavailable {
+		t.Fatalf("selection failure = %#v, err=%v", unavailable, err)
+	}
+	audits, total, err := auditRepo.List(ctx, 0, 10)
+	if err != nil || total != 0 || len(audits) != 0 {
+		t.Fatalf("audits=%#v total=%d err=%v", audits, total, err)
+	}
+}
+
 func TestGatewayPinnedResponseReturnsCachedTeamRateLimitWithoutSpinning(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "pinned-team-rate-limit.db"))
