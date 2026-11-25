@@ -862,7 +862,7 @@ func (r *AccountRepository) ListDueMissingThinkingRechecks(ctx context.Context, 
 	}
 	var rows []accountModel
 	err := r.db.db.WithContext(ctx).
-		Where("enabled = ? AND auth_status = ? AND last_error = ? AND (cooldown_until IS NULL OR cooldown_until <= ?)", true, account.AuthStatusActive, account.LastErrorMissingThinking, now).
+		Where("enabled = ? AND auth_status = ? AND last_error = ? AND cooldown_until IS NOT NULL AND cooldown_until <= ?", true, account.AuthStatusActive, account.LastErrorMissingThinking, now).
 		Order("cooldown_until ASC, id ASC").
 		Limit(limit).
 		Find(&rows).Error

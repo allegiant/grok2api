@@ -21,8 +21,8 @@ func TestThinkingRecheckHeldOnlyAfterMissingThinkingCooldown(t *testing.T) {
 	if thinkingRecheckHeld(account.Credential{LastError: "upstream timeout", CooldownUntil: &past}, now) {
 		t.Fatal("ordinary failure cooldown should return when the timer elapses")
 	}
-	if !thinkingRecheckHeld(account.Credential{LastError: account.LastErrorMissingThinking}, now) {
-		t.Fatal("missing-thinking strike without a future cooldown must stay out")
+	if thinkingRecheckHeld(account.Credential{LastError: account.LastErrorMissingThinking}, now) {
+		t.Fatal("a cleared cooldown must return the account even while the strike remains")
 	}
 }
 

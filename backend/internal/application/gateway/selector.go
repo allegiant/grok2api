@@ -1097,13 +1097,13 @@ func (s *Selector) verifiedThinkingSnapshot(provider account.Provider, now time.
 const thinkingRecheckDelay = 10 * time.Minute
 
 // thinkingRecheckHeld keeps a missing-thinking account out of ordinary
-// selection after its cooldown has elapsed. A dedicated probe must observe
-// thinking again before the account can serve traffic.
+// selection after its cooldown timestamp has elapsed. A nil cooldown is an
+// explicit release, including the administrator clear that keeps the strike.
 func thinkingRecheckHeld(credential account.Credential, now time.Time) bool {
-	if credential.LastError != account.LastErrorMissingThinking {
+	if credential.LastError != account.LastErrorMissingThinking || credential.CooldownUntil == nil {
 		return false
 	}
-	return credential.CooldownUntil == nil || !now.Before(*credential.CooldownUntil)
+	return !now.Before(*credential.CooldownUntil)
 }
 
 func isMissingThinkingStrike(lastError string) bool {

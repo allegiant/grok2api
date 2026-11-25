@@ -140,7 +140,7 @@ type AccountRepository interface {
 	// ListReauthAccountIDsByLastError 列出指定 Provider 下 last_error 精确匹配的 reauthRequired 账号。
 	ListReauthAccountIDsByLastError(ctx context.Context, provider account.Provider, lastError string) ([]uint64, error)
 	// ListDueMissingThinkingRechecks lists enabled active accounts whose missing-thinking
-	// cooldown has elapsed and which must be probed before returning to the pool.
+	// cooldown timestamp has elapsed. A nil cooldown is an explicit release and is not due.
 	ListDueMissingThinkingRechecks(ctx context.Context, now time.Time, limit int) ([]account.Credential, error)
 	// ListAutoCleanReauthCandidates 以 ID 游标列出达到清理年龄的 reauthRequired 账号。
 	ListAutoCleanReauthCandidates(ctx context.Context, markedBefore time.Time, includeDisabled bool, afterID uint64, limit int) ([]uint64, error)
