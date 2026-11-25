@@ -856,6 +856,26 @@ func (r *AccountRepository) listRoutingBoundAccountIDs(ctx context.Context, prov
 	return accountIDs, nil
 }
 
+func (r *AccountRepository) ListDueMissingThinkingRechecks(ctx context.Context, now time.Time, limit int) ([]account.Credential, error) {
+	if limit <= 0 || limit > 20 {
+		limit = 10
+	}
+	var rows []accountModel
+	err := r.db.db.WithContext(ctx).
+		Where("enabled = ? AND auth_status = ? AND last_error = ? AND (cooldown_until IS NULL OR cooldown_until <= ?)", true, account.AuthStatusActive, account.LastErrorMissingThinking, now).
+		Order("cooldown_until ASC, id ASC").
+		Limit(limit).
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]account.Credential, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toAccountDomain(row))
+	}
+	return out, nil
+}
+
 func (r *AccountRepository) ListEnabled(ctx context.Context, provider account.Provider) ([]account.Credential, error) {
 	rows, err := r.listActiveProviderAccountRows(ctx, provider, nil)
 	if err != nil {

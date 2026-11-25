@@ -582,6 +582,11 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			earliestRetry = earlierFuture(earliestRetry, *value.CooldownUntil, now)
 			continue
 		}
+		if thinkingRecheckHeld(value, now) {
+			coolingCandidates++
+			earliestRetry = earlierFuture(earliestRetry, now.Add(thinkingRecheckDelay), now)
+			continue
+		}
 		quotaRecovery := candidate.QuotaRecovery
 		if quotaRecovery != nil && quotaRecovery.Status != account.QuotaRecoveryStatusActive {
 			if allowQuotaProbe && quotaRecovery.NextProbeAt != nil && !now.Before(*quotaRecovery.NextProbeAt) {
@@ -839,20 +844,21 @@ func isSelectionUnavailable(err error, reason SelectionUnavailableReason) bool {
 
 // AcquirePinned 为 previous_response_id 等账号归属请求获取指定账号租约。
 func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool) (*accountLease, error) {
-	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, false, clientkeydomain.AccountScope{})
+	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, false, false, clientkeydomain.AccountScope{})
 }
 
 func (s *Selector) AcquirePinnedForKey(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool, scope clientkeydomain.AccountScope) (*accountLease, error) {
-	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, false, scope)
+	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, false, false, scope)
 }
 
 // AcquirePinnedForQualityProbe keeps every ordinary eligibility check while
-// bypassing only the exact account+node lease block being recovery-tested.
+// bypassing only the exact account+node lease block being recovery-tested
+// and the post-cooldown missing-thinking hold.
 func (s *Selector) AcquirePinnedForQualityProbe(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, scope clientkeydomain.AccountScope) (*accountLease, error) {
-	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, true, true, scope)
+	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, true, true, true, scope)
 }
 
-func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference, ignoreEgressLeaseBlock bool, requestedScope clientkeydomain.AccountScope) (lease *accountLease, err error) {
+func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference, ignoreEgressLeaseBlock, ignoreThinkingRecheck bool, requestedScope clientkeydomain.AccountScope) (lease *accountLease, err error) {
 	accountScope, scopeValid := clientkeydomain.NormalizeAccountScope(requestedScope)
 	defer annotateSelectionAccountScope(&err, accountScope)
 	if !scopeValid || !accountScope.AllowsProvider(provider) {
@@ -891,6 +897,9 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 			}
 			if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
 				return nil, &SelectionUnavailableError{Reason: SelectionCooling, RetryAfter: retryDelay(now, *value.CooldownUntil)}
+			}
+			if !ignoreThinkingRecheck && thinkingRecheckHeld(value, now) {
+				return nil, &SelectionUnavailableError{Reason: SelectionCooling, RetryAfter: thinkingRecheckDelay, AccountID: accountID, AccountName: value.Name}
 			}
 			if recovery := candidate.QuotaRecovery; recovery != nil && recovery.Status != account.QuotaRecoveryStatusActive {
 				if recovery.NextProbeAt == nil || now.Before(*recovery.NextProbeAt) {
@@ -1083,6 +1092,18 @@ func (s *Selector) verifiedThinkingSnapshot(provider account.Provider, now time.
 		}
 	}
 	return snapshot
+}
+
+const thinkingRecheckDelay = 10 * time.Minute
+
+// thinkingRecheckHeld keeps a missing-thinking account out of ordinary
+// selection after its cooldown has elapsed. A dedicated probe must observe
+// thinking again before the account can serve traffic.
+func thinkingRecheckHeld(credential account.Credential, now time.Time) bool {
+	if credential.LastError != account.LastErrorMissingThinking {
+		return false
+	}
+	return credential.CooldownUntil == nil || !now.Before(*credential.CooldownUntil)
 }
 
 func isMissingThinkingStrike(lastError string) bool {
@@ -1326,6 +1347,27 @@ func (s *Selector) markMissingThinking(ctx context.Context, credential account.C
 		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	}
 	return missingThinkingPenaltyCooled, nil
+}
+
+func (s *Selector) clearMissingThinkingStrike(ctx context.Context, credential account.Credential) error {
+	if err := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, 0, nil, "", true); err != nil {
+		return err
+	}
+	s.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountHealthChanged, Provider: credential.Provider, AccountID: credential.ID,
+	})
+	return nil
+}
+
+func (s *Selector) deferMissingThinkingRecheck(ctx context.Context, credential account.Credential, until time.Time) error {
+	if err := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, credential.FailureCount, &until, account.LastErrorMissingThinking, false); err != nil {
+		return err
+	}
+	s.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountHealthChanged, Provider: credential.Provider, AccountID: credential.ID,
+		FailureCount: credential.FailureCount, CooldownUntil: &until, HealthMarker: account.LastErrorMissingThinking,
+	})
+	return nil
 }
 
 func (s *Selector) disableAccount(ctx context.Context, credential account.Credential) error {
@@ -2166,6 +2208,9 @@ func (s *Selector) claimAccountSlotTracked(ctx context.Context, value account.Cr
 	now := time.Now().UTC()
 	value = s.applyRoutingHealth(value, now)
 	if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
+		return nil, nil
+	}
+	if thinkingRecheckHeld(value, now) {
 		return nil, nil
 	}
 	limit := value.MaxConcurrent

@@ -130,6 +130,9 @@ type Input struct {
 	// ForcedAccountID is paired with ForcedEgressNodeID only by the internal
 	// Quality Guard recovery path. It never accepts public request input.
 	ForcedAccountID uint64
+	// thinkingRecheck pins one expired missing-thinking account without requiring
+	// a forced egress node. Public handlers never set it.
+	thinkingRecheck bool
 }
 
 type Usage struct {
@@ -1264,7 +1267,7 @@ attemptLoop:
 		var err error
 		selectionStarted := time.Now()
 		if input.ForcedAccountID != 0 {
-			if input.ForcedEgressNodeID == 0 {
+			if input.ForcedEgressNodeID == 0 && !input.thinkingRecheck {
 				err = &SelectionUnavailableError{Reason: SelectionNoAccounts}
 			} else {
 				lease, err = s.selector.AcquirePinnedForQualityProbe(ctx, route.Provider, input.ForcedAccountID, route.ID, route.UpstreamModel, quotaMode, accountScope)

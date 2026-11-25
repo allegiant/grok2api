@@ -139,6 +139,9 @@ type AccountRepository interface {
 	CountCleanupWithLinked(ctx context.Context, provider account.Provider, statuses []string, now time.Time, targets []account.Provider) (CleanupPreview, error)
 	// ListReauthAccountIDsByLastError 列出指定 Provider 下 last_error 精确匹配的 reauthRequired 账号。
 	ListReauthAccountIDsByLastError(ctx context.Context, provider account.Provider, lastError string) ([]uint64, error)
+	// ListDueMissingThinkingRechecks lists enabled active accounts whose missing-thinking
+	// cooldown has elapsed and which must be probed before returning to the pool.
+	ListDueMissingThinkingRechecks(ctx context.Context, now time.Time, limit int) ([]account.Credential, error)
 	// ListAutoCleanReauthCandidates 以 ID 游标列出达到清理年龄的 reauthRequired 账号。
 	ListAutoCleanReauthCandidates(ctx context.Context, markedBefore time.Time, includeDisabled bool, afterID uint64, limit int) ([]uint64, error)
 	// DeleteAutoCleanReauthCandidates 在事务内重新校验状态与年龄并跳过活动视频任务，返回实际删除 ID。
