@@ -510,8 +510,8 @@ func TestShortZeroReasoningReplyHonorsConfiguredOutputFloor(t *testing.T) {
 	if got := ClassifyQualityHold(sig, 8); got != QualityDeliver {
 		t.Fatalf("4-token response should remain below the default 8-token floor, got %s", got)
 	}
-	if got := ClassifyQualityHold(sig, 4); got != QualityWithhold {
-		t.Fatalf("4-token zero-reasoning response should be withheld with a 4-token floor, got %s", got)
+	if got := ClassifyQualityHold(sig, 4); got != QualityDeliverPenalized {
+		t.Fatalf("4-token zero-reasoning prose should be delivered and penalized at a 4-token floor, got %s", got)
 	}
 }
 
