@@ -2356,7 +2356,7 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 		}
 	})
 
-	t.Run("multi-account clean 0-reasoning exhaustion rejects under fail_closed and applies full penalty", func(t *testing.T) {
+	t.Run("tool call withhold then finished prose is delivered and both accounts are cooled", func(t *testing.T) {
 		ctx := context.Background()
 		responses := make(map[uint64][]scriptedBuildResponse)
 		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-strict-penalty.db", responses)
@@ -2369,30 +2369,35 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 		responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanTextStreamNoReasoning}}
 		responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
 
-		_, err := service.CreateResponse(ctx, Input{
+		result, err := service.CreateResponse(ctx, Input{
 			RequestID: "req-mt-exhaust", ClientKey: key, PublicModel: "grok-4.7",
 			PromptCacheSeed: "session-exhaust", Streaming: true, Body: toolContinuationBody,
 		})
-		var failure *UpstreamFailure
-		if !errors.As(err, &failure) || failure.HTTPStatus != http.StatusServiceUnavailable || failure.Code != ErrorQualityDegraded {
-			t.Fatalf("fail_closed must strictly reject 0-reasoning exhaustion with 503 quality_degraded, got err=%v", err)
+		if err != nil {
+			t.Fatalf("finished prose must be delivered, got err=%v", err)
 		}
-		if attempts := adapter.Attempts(); len(attempts) != 3 {
-			t.Fatalf("expected all 3 isolated accounts to be tried, got %v", attempts)
+		body, _ := io.ReadAll(result.Body)
+		result.Finalize(Usage{Reported: true, OutputTokens: 30}, "resp-mt-text", "")
+		_ = result.Body.Close()
+		if !strings.Contains(string(body), "TAIL_CHUNK_DELIVERED") {
+			t.Fatalf("client must receive the finished prose, got %s", body)
 		}
-		keys := adapter.PromptCacheKeys()
-		if len(keys) != 3 || keys[0] == keys[1] || keys[1] == keys[2] || keys[0] == keys[2] {
-			t.Fatalf("expected 3 distinct per-account prompt_cache_keys, got %v", keys)
+		attempts := adapter.Attempts()
+		if len(attempts) != 2 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID {
+			t.Fatalf("expected tool-call withhold then prose delivery, got %v", attempts)
 		}
-		for _, cred := range credentials {
-			acct, _ := accountRepo.Get(ctx, cred.ID)
+		for _, id := range attempts {
+			acct, _ := accountRepo.Get(ctx, id)
 			if acct.CooldownUntil == nil || acct.LastError != lastErrorMissingThinking {
-				t.Fatalf("account %d must receive full missing-thinking cooldown: %#v", cred.ID, acct)
+				t.Fatalf("account %d must receive full missing-thinking cooldown: %#v", id, acct)
 			}
-			remaining := time.Until(*acct.CooldownUntil)
-			if remaining < 23*time.Hour {
-				t.Fatalf("expected full ~24h cooldown for degraded account %d, got %s", cred.ID, remaining)
+			if remaining := time.Until(*acct.CooldownUntil); remaining < 23*time.Hour {
+				t.Fatalf("expected full ~24h cooldown for degraded account %d, got %s", id, remaining)
 			}
+		}
+		untouched, _ := accountRepo.Get(ctx, credentials[2].ID)
+		if untouched.CooldownUntil != nil {
+			t.Fatalf("prose delivery must stop the retry loop, account %d was cooled: %#v", credentials[2].ID, untouched)
 		}
 		logs, _, _ := auditRepo.List(ctx, 0, 10)
 		degradedAudits := 0
@@ -2401,8 +2406,8 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 				degradedAudits++
 			}
 		}
-		if degradedAudits != 3 {
-			t.Fatalf("expected 3 quality_degraded attempt audits, got %d", degradedAudits)
+		if degradedAudits != 1 {
+			t.Fatalf("expected only the tool-call withhold to record quality_degraded, got %d", degradedAudits)
 		}
 	})
 
