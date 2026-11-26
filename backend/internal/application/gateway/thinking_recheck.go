@@ -19,7 +19,10 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
 
-const thinkingRecheckDefaultModel = "grok-4.7"
+const (
+	thinkingRecheckDefaultModel    = "grok-4.7"
+	thinkingRecheckMinOutputTokens = int64(64)
+)
 
 // RecheckDueMissingThinking probes accounts whose missing-thinking cooldown has
 // elapsed. Ordinary selection keeps them out until a probe shows thinking again.
@@ -85,15 +88,15 @@ func (s *Service) recheckMissingThinking(ctx context.Context, credential account
 		payload, _ := io.ReadAll(io.LimitReader(result.Body, 32<<10))
 		return fmt.Errorf("质量复查上游返回 %d: %s", result.StatusCode, strings.TrimSpace(string(payload)))
 	}
-	thinking, err := thinkingRecheckStreamHasThinking(result.Body)
+	observed, err := observeThinkingRecheck(result.Body)
 	if err != nil {
 		return err
 	}
-	if thinking {
+	if thinkingRecheckPassed(observed, input) {
 		if err := s.selector.clearMissingThinkingStrike(ctx, credential); err != nil {
 			return err
 		}
-		s.logger.Info("thinking_recheck_released", "account_id", credential.ID, "provider", credential.Provider)
+		s.logger.Info("thinking_recheck_released", "account_id", credential.ID, "provider", credential.Provider, "reasoning_tokens", observed.ReasoningTokens, "output_tokens", observed.OutputTokens)
 		return nil
 	}
 	cooldown := s.qualityRetryConfig().AccountCooldown
@@ -108,21 +111,29 @@ func (s *Service) recheckMissingThinking(ctx context.Context, credential account
 	return nil
 }
 
-func thinkingRecheckStreamHasThinking(body io.Reader) (bool, error) {
+type thinkingRecheckObservation struct {
+	Text            string
+	Thinking        bool
+	OutputTokens    int64
+	ReasoningTokens int64
+}
+
+func observeThinkingRecheck(body io.Reader) (thinkingRecheckObservation, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	var observed thinkingRecheckObservation
+	var visible strings.Builder
 	totalBytes := 0
 	terminal := false
-	thinking := false
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		totalBytes += len(line) + 1
 		if totalBytes > qualityProbeMaxStreamBytes {
-			return false, fmt.Errorf("质量复查响应超过 %d MiB", qualityProbeMaxStreamBytes>>20)
+			return thinkingRecheckObservation{}, fmt.Errorf("质量复查响应超过 %d MiB", qualityProbeMaxStreamBytes>>20)
 		}
 		line = []byte(strings.TrimSpace(string(line)))
 		if bytes.Equal(line, []byte(": grok2api-reasoning-start")) {
-			thinking = true
+			observed.Thinking = true
 			continue
 		}
 		if !strings.HasPrefix(string(line), "data:") {
@@ -137,21 +148,46 @@ func thinkingRecheckStreamHasThinking(body io.Reader) (bool, error) {
 		if json.Unmarshal([]byte(payload), &event) != nil {
 			continue
 		}
-		if event.Usage != nil && event.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
-			thinking = true
+		if event.Usage != nil {
+			observed.OutputTokens = int64(event.Usage.CompletionTokens)
+			if event.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
+				observed.ReasoningTokens = int64(event.Usage.CompletionTokensDetails.ReasoningTokens)
+				observed.Thinking = true
+			}
 		}
 		for _, choice := range event.Choices {
 			delta := choice.Delta
+			if delta.Content != "" {
+				visible.WriteString(delta.Content)
+			}
 			if delta.Reasoning != "" || delta.ReasoningContent != "" || delta.ThinkingContent != "" {
-				thinking = true
+				observed.Thinking = true
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return false, fmt.Errorf("读取质量复查流: %w", err)
+		return thinkingRecheckObservation{}, fmt.Errorf("读取质量复查流: %w", err)
 	}
 	if !terminal {
-		return false, fmt.Errorf("质量复查流未正常结束")
+		return thinkingRecheckObservation{}, fmt.Errorf("质量复查流未正常结束")
 	}
-	return thinking, nil
+	observed.Text = visible.String()
+	return observed, nil
+}
+
+// thinkingRecheckPassed applies the active probe profile. A missing-thinking
+// account is released only when the expected marker matches and, when the
+// profile requires thinking, the completed response has reasoning tokens.
+func thinkingRecheckPassed(observed thinkingRecheckObservation, input egressapp.QualityProbeInput) bool {
+	if !egressapp.MatchExpected(observed.Text, input.Expected, input.MatchMode) {
+		return false
+	}
+	if !input.RequireThinking {
+		return observed.Thinking || observed.ReasoningTokens > 0
+	}
+	output := observed.OutputTokens
+	if output <= 0 {
+		output = int64(len(strings.TrimSpace(observed.Text))+3) / 4
+	}
+	return observed.ReasoningTokens > 0 && output >= thinkingRecheckMinOutputTokens
 }

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 )
 
@@ -26,13 +27,14 @@ func TestThinkingRecheckHeldOnlyAfterMissingThinkingCooldown(t *testing.T) {
 	}
 }
 
-func TestThinkingRecheckStreamRequiresReasoning(t *testing.T) {
-	thinking, err := thinkingRecheckStreamHasThinking(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":{\"completion_tokens\":5}}\n\ndata: [DONE]\n"))
-	if err != nil || thinking {
-		t.Fatalf("thinking=%v err=%v", thinking, err)
+func TestThinkingRecheckUsesProfileMarkerAndThinking(t *testing.T) {
+	profile := egressapp.QualityProbeInput{Expected: "QUALITY_OK", MatchMode: egressapp.MatchLastLine, RequireThinking: true}
+	plain, err := observeThinkingRecheck(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hello\\nQUALITY_OK\"}}],\"usage\":{\"completion_tokens\":80,\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\ndata: [DONE]\n"))
+	if err != nil || thinkingRecheckPassed(plain, profile) {
+		t.Fatalf("marker without reasoning released: %#v err=%v", plain, err)
 	}
-	thinking, err = thinkingRecheckStreamHasThinking(strings.NewReader("data: {\"choices\":[{\"delta\":{\"reasoning\":\"plan\"}}]}\n\ndata: [DONE]\n"))
-	if err != nil || !thinking {
-		t.Fatalf("thinking=%v err=%v", thinking, err)
+	thought, err := observeThinkingRecheck(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"1. A B C D\\nQUALITY_OK\"}}],\"usage\":{\"completion_tokens\":90,\"completion_tokens_details\":{\"reasoning_tokens\":40}}}\n\ndata: [DONE]\n"))
+	if err != nil || !thinkingRecheckPassed(thought, profile) {
+		t.Fatalf("profile pass = %#v err=%v", thought, err)
 	}
 }

@@ -60,32 +60,33 @@ const (
 
 // Application 管理后端进程生命周期和本地后台任务。
 type Application struct {
-	logger               *slog.Logger
-	database             *relational.Database
-	server               *http.Server
-	audits               *auditapp.Service
-	responses            repository.ResponseRepository
-	cleanupLock          repository.DistributedLock
-	runtime              io.Closer
-	settingsBus          repository.SettingsChangeBus
-	invalidationBus      repository.InvalidationBus
-	settings             *settingsapp.Service
-	gateway              *gateway.Service
-	media                *mediaapp.Service
-	quotaRecovery        *quotarecoveryapp.Service
-	accounts             *accountapp.Service
-	models               *modelapp.Service
-	clientKeys           *clientkeyapp.Service
-	updates              *updatecheckapp.Service
-	invalidations        *invalidationapp.Service
-	accountRepo          repository.AccountRepository
-	modelRepo            repository.ModelRepository
-	providers            *provider.Registry
-	web                  *webprovider.Adapter
-	egress               *infraegress.Manager
-	egressOps            *egressapp.Service
-	startup              *startupState
-	thinkingRecheckProbe egressapp.QualityProbeInput
+	logger                   *slog.Logger
+	database                 *relational.Database
+	server                   *http.Server
+	audits                   *auditapp.Service
+	responses                repository.ResponseRepository
+	cleanupLock              repository.DistributedLock
+	runtime                  io.Closer
+	settingsBus              repository.SettingsChangeBus
+	invalidationBus          repository.InvalidationBus
+	settings                 *settingsapp.Service
+	gateway                  *gateway.Service
+	media                    *mediaapp.Service
+	quotaRecovery            *quotarecoveryapp.Service
+	accounts                 *accountapp.Service
+	models                   *modelapp.Service
+	clientKeys               *clientkeyapp.Service
+	updates                  *updatecheckapp.Service
+	invalidations            *invalidationapp.Service
+	accountRepo              repository.AccountRepository
+	modelRepo                repository.ModelRepository
+	providers                *provider.Registry
+	web                      *webprovider.Adapter
+	egress                   *infraegress.Manager
+	egressOps                *egressapp.Service
+	startup                  *startupState
+	thinkingRecheckProbe     egressapp.QualityProbeInput
+	qualityGuardProfilesPath string
 }
 
 // New 完成数据库、Provider、应用服务和 HTTP 路由装配。
@@ -444,8 +445,28 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		audits: auditService, responses: responseRepo, cleanupLock: refreshLock, runtime: runtimeStore,
 		settingsBus: settingsBus, invalidationBus: invalidationBus, settings: settingsService, gateway: gatewayService, media: mediaService, quotaRecovery: quotaRecoveryService, accounts: accountService, models: modelService, clientKeys: clientKeyService, updates: updateService, invalidations: invalidationService,
 		accountRepo: accountRepo, modelRepo: modelRepo, providers: providers, web: webAdapter, egress: egressManager, egressOps: egressService, startup: startup,
-		thinkingRecheckProbe: qualityGuardProbe,
+		thinkingRecheckProbe: qualityGuardProbe, qualityGuardProfilesPath: qualityGuardPath("profiles.json"),
 	}, nil
+}
+
+func (a *Application) thinkingRecheckInput() egressapp.QualityProbeInput {
+	input := a.thinkingRecheckProbe
+	profile, ok, err := infraqualityguard.LoadActiveProbeProfile(a.qualityGuardProfilesPath)
+	if err != nil {
+		a.logger.Warn("thinking_recheck_profile_unavailable", "error", err)
+		return input
+	}
+	if !ok {
+		return input
+	}
+	input.Prompt = profile.Prompt
+	input.Expected = profile.ExpectedText
+	input.MatchMode = profile.MatchMode
+	input.RequireThinking = profile.RequireThinking
+	if profile.MaxOutputTokens > 0 {
+		input.MaxOutputTokens = profile.MaxOutputTokens
+	}
+	return input
 }
 
 func invalidationSourceInstance(cfg config.Config) string {
@@ -618,7 +639,7 @@ func (a *Application) Run(ctx context.Context) error {
 					runCtx, cancel := context.WithTimeout(taskCtx, budget)
 					due, err := a.accountRepo.ListDueMissingThinkingRechecks(runCtx, time.Now().UTC(), 10)
 					if err == nil && len(due) > 0 {
-						a.gateway.RecheckDueMissingThinking(runCtx, due, a.thinkingRecheckProbe)
+						a.gateway.RecheckDueMissingThinking(runCtx, due, a.thinkingRecheckInput())
 					}
 					cancel()
 					if err != nil && taskCtx.Err() == nil {
