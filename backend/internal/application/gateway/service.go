@@ -536,6 +536,12 @@ func (s *Service) CreateChatCompletion(ctx context.Context, input Input) (*Resul
 // CreateMessage executes an Anthropic Messages request through the unified Responses upstream.
 func (s *Service) CreateMessage(ctx context.Context, input Input) (*Result, error) {
 	input.Operation = audit.OperationMessages
+	if classifyResponsesCompactionRequest(input.Body) != responsesCompactionNone {
+		// Claude Code compaction stays on the Messages API. Keep routing and
+		// upstream normalization unchanged; only skip the reasoning-quality hold.
+		input.auditOperation = audit.OperationCompaction
+		input.skipQualityHold = true
+	}
 	return s.createResponseAt(ctx, input, "/responses")
 }
 
@@ -1727,6 +1733,17 @@ attemptLoop:
 					// from post-hold output-speed penalties distorted by prefix buffering.
 					s.selector.MarkVerifiedThinking(credential.ID)
 					skipOutputSpeedPenalty = true
+				}
+				if verdict == QualityDeliverPenalized {
+					s.logger.Info("quality_text_delivered_cooldown",
+						"request_id", input.RequestID,
+						"account_id", credential.ID,
+						"quality_attempt", qualityAccountAttempts,
+						"output_tokens", peekUsage.OutputTokens,
+						"reasoning_tokens", peekUsage.ReasoningTokens,
+					)
+					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown, holdCfg.AutoDisable)
+					missingThinkingPenalized = true
 				}
 				if verdict == QualityWithhold {
 					s.logger.Info("quality_degraded_diagnostic",

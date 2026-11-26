@@ -37,17 +37,17 @@ func TestClassifyQualityHold(t *testing.T) {
 		want QualityVerdict
 	}{
 		{name: "thinking delivers", sig: QualityStreamSignals{HasThinking: true, HasReasoningDelta: true, VisibleTokens: 10}, want: QualityDeliver},
-		{name: "usage reasoning tokens alone withhold", sig: QualityStreamSignals{ReasoningTokens: 40, VisibleTokens: 80, Terminal: true}, want: QualityWithhold},
-		{name: "visible 32 no think withhold", sig: QualityStreamSignals{VisibleTokens: 32, Terminal: true}, want: QualityWithhold},
-		{name: "output 40 no think withhold", sig: QualityStreamSignals{OutputTokens: 40, Terminal: true}, want: QualityWithhold},
+		{name: "usage reasoning tokens alone withhold", sig: QualityStreamSignals{ReasoningTokens: 40, VisibleTokens: 80, Terminal: true}, want: QualityDeliverPenalized},
+		{name: "visible 32 no think delivers and penalizes", sig: QualityStreamSignals{VisibleTokens: 32, Terminal: true}, want: QualityDeliverPenalized},
+		{name: "output 40 no visible text withholds", sig: QualityStreamSignals{OutputTokens: 40, Terminal: true}, want: QualityWithhold},
 		{name: "short visible output ignores inflated total", sig: QualityStreamSignals{VisibleTokens: 1, OutputTokens: 80, Terminal: true}, want: QualityDeliver},
 		{name: "short no think delivers", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true}, want: QualityDeliver},
 		{name: "empty terminal waits for transport handling", sig: QualityStreamSignals{Terminal: true}, want: QualityWait},
-		{name: "midstream enough content withhold", sig: QualityStreamSignals{VisibleTokens: 64}, want: QualityWithhold},
+		{name: "midstream enough content waits", sig: QualityStreamSignals{VisibleTokens: 64}, want: QualityWait},
 		{name: "stub midstream waits even with enough visible", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64}, want: QualityWait},
-		{name: "stub hold expiry with enough visible withholds", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, HoldExpired: true}, want: QualityWithhold},
+		{name: "stub hold expiry with enough visible delivers and penalizes", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, HoldExpired: true}, want: QualityDeliverPenalized},
 		{name: "stub-only hold expiry keeps waiting", sig: QualityStreamSignals{ReasoningStarted: true, HoldExpired: true}, want: QualityWait},
-		{name: "stub terminal enough withhold", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, Terminal: true}, want: QualityWithhold},
+		{name: "stub terminal enough text delivers and penalizes", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, Terminal: true}, want: QualityDeliverPenalized},
 		{name: "wait for more", sig: QualityStreamSignals{VisibleTokens: 8}, want: QualityWait},
 		{name: "hold expired short delivers", sig: QualityStreamSignals{VisibleTokens: 8, HoldExpired: true}, want: QualityDeliver},
 		{name: "hold expired empty waits", sig: QualityStreamSignals{HoldExpired: true}, want: QualityWait},
@@ -191,9 +191,9 @@ func TestClassifyQualityHoldBurst(t *testing.T) {
 			want: QualityWithhold,
 		},
 		{
-			name: "no-think CJK low rune count 57 output tokens 0 reasoning withholds",
+			name: "no-think CJK low rune count 57 output tokens 0 reasoning delivers and penalizes",
 			sig:  QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 5, OutputTokens: 57, ReasoningTokens: 0, FirstVisible: true, VisibleFlushMS: 2, Terminal: true, UsageReported: true},
-			want: QualityWithhold,
+			want: QualityDeliverPenalized,
 		},
 	}
 	for _, test := range tests {
@@ -477,8 +477,8 @@ func TestObserveQualityChunkNoThinkEnoughChat(t *testing.T) {
 	if sig.HasThinking || !sig.Terminal || sig.VisibleTokens < 32 {
 		t.Fatalf("no-think fixture signals = %#v", sig)
 	}
-	if ClassifyQualityHold(sig, 32) != QualityWithhold {
-		t.Fatalf("no-think enough should withhold, got %s (%#v)", ClassifyQualityHold(sig, 32), sig)
+	if ClassifyQualityHold(sig, 32) != QualityDeliverPenalized {
+		t.Fatalf("no-think enough text should deliver and penalize, got %s (%#v)", ClassifyQualityHold(sig, 32), sig)
 	}
 }
 
@@ -654,8 +654,8 @@ func TestObserveQualityConvertedShortEncryptedStubDoesNotBypassFloor(t *testing.
 			if sig.HasThinking || sig.EncryptedBytes != len(stub) || !sig.ReasoningStarted {
 				t.Fatalf("converted short stub signals = %#v\n%s", sig, converted)
 			}
-			if got := ClassifyQualityHold(sig, 32); got != QualityWithhold {
-				t.Fatalf("converted short stub verdict = %s, want withhold", got)
+			if got := ClassifyQualityHold(sig, 32); got != QualityDeliverPenalized {
+				t.Fatalf("converted short stub verdict = %s, want deliver_penalized", got)
 			}
 		})
 	}
@@ -718,8 +718,8 @@ func TestObserveQualityChunkResponsesReasoningItem(t *testing.T) {
 	if !fakeSig.ReasoningStarted || fakeSig.ReasoningTokens != 60 {
 		t.Fatalf("usage-only signals = %#v", fakeSig)
 	}
-	if ClassifyQualityHold(fakeSig, 32) != QualityWithhold {
-		t.Fatalf("usage-only reasoning with no deltas must withhold: %#v", fakeSig)
+	if ClassifyQualityHold(fakeSig, 32) != QualityDeliverPenalized {
+		t.Fatalf("usage-only reasoning with visible text must deliver and penalize: %#v", fakeSig)
 	}
 
 	real := qualityScanState{protocol: qualityProtocolResponses}
@@ -750,8 +750,8 @@ func TestObserveQualityChunkResponsesReasoningItem(t *testing.T) {
 	if shortSig.EncryptedBytes == 0 || !shortSig.ReasoningStarted || shortSig.ReasoningTokens != 60 {
 		t.Fatalf("short encrypted stub signals = %#v", shortSig)
 	}
-	if ClassifyQualityHold(shortSig, 32) != QualityWithhold {
-		t.Fatalf("short encrypted stub must withhold: %#v", shortSig)
+	if ClassifyQualityHold(shortSig, 32) != QualityDeliverPenalized {
+		t.Fatalf("short encrypted stub with visible text must deliver and penalize: %#v", shortSig)
 	}
 
 	cipher := strings.Repeat("A", defaultMinEncryptedBytes*8)
@@ -803,8 +803,8 @@ func TestObserveQualityChunkEmptyReasoningStubIsNotThinking(t *testing.T) {
 	if !chatSig.ReasoningStarted || !chatSig.Terminal || chatSig.ReasoningTokens != 0 {
 		t.Fatalf("chat stub signals = %#v", chatSig)
 	}
-	if ClassifyQualityHold(chatSig, 32) != QualityWithhold {
-		t.Fatalf("chat stub + 0 reasoning must withhold, got %s (%#v)", ClassifyQualityHold(chatSig, 32), chatSig)
+	if ClassifyQualityHold(chatSig, 32) != QualityDeliverPenalized {
+		t.Fatalf("chat stub + visible text must deliver and penalize, got %s (%#v)", ClassifyQualityHold(chatSig, 32), chatSig)
 	}
 
 	mid := qualityScanState{protocol: qualityProtocolChat}
@@ -830,8 +830,8 @@ func TestObserveQualityChunkEmptyReasoningStubIsNotThinking(t *testing.T) {
 	if respSig.HasThinking {
 		t.Fatalf("empty responses reasoning item must not count as thinking: %#v", respSig)
 	}
-	if ClassifyQualityHold(respSig, 32) != QualityWithhold {
-		t.Fatalf("empty reasoning item + 0 tokens must withhold, got %s (%#v)", ClassifyQualityHold(respSig, 32), respSig)
+	if ClassifyQualityHold(respSig, 32) != QualityDeliverPenalized {
+		t.Fatalf("empty reasoning item with visible text must deliver and penalize, got %s (%#v)", ClassifyQualityHold(respSig, 32), respSig)
 	}
 
 	cipher := strings.Repeat("A", defaultMinEncryptedBytes*2)
@@ -958,7 +958,7 @@ func TestPeekQualityStreamWithholdsNoThinkEnough(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replay.Close()
-	if verdict != QualityWithhold {
+	if verdict != QualityDeliverPenalized {
 		t.Fatalf("verdict=%s usage=%#v", verdict, usage)
 	}
 	if usage.ReasoningTokens != 0 || usage.OutputTokens < 32 {
@@ -968,9 +968,8 @@ func TestPeekQualityStreamWithholdsNoThinkEnough(t *testing.T) {
 
 func TestPeekThenDecideQualityRetryBounded(t *testing.T) {
 	t.Parallel()
-	content := strings.Repeat("abcd", 40)
 	fixture := sse(
-		`data: {"choices":[{"delta":{"content":"`+content+`"}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"abcd\"}"}}]}}]}`,
 		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
 		"data: [DONE]",
 	)
@@ -1002,7 +1001,7 @@ func TestPeekThenDecideQualityRetryBounded(t *testing.T) {
 		t.Fatalf("second withhold fail-open action=%s", action2)
 	}
 	got, _ := io.ReadAll(replay2)
-	if !strings.Contains(string(got), content) {
+	if !strings.Contains(string(got), "abcd") {
 		t.Fatalf("fail-open must still deliver the last body, got %q", got)
 	}
 }
@@ -1116,8 +1115,8 @@ func TestPeekQualityStreamHoldTimeoutDeliversStartedReasoningAndPreservesLateEvi
 	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > 200*time.Millisecond {
 		t.Fatalf("peek returned after %s, want the 30ms hold timeout", elapsed)
 	}
-	if verdict != QualityWithhold {
-		t.Fatalf("started reasoning stub at hold timeout verdict = %s, want withhold", verdict)
+	if verdict != QualityDeliverPenalized {
+		t.Fatalf("started reasoning stub at hold timeout verdict = %s, want deliver_penalized", verdict)
 	}
 	close(continueWrite)
 	body, err := io.ReadAll(replay)
@@ -1338,7 +1337,7 @@ func TestPeekQualityStreamTerminalSemanticOutputIsNotEmpty(t *testing.T) {
 			stream: sse(
 				`data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"message","content":[{"type":"output_text","text":"` + longText + `"}]}]}}`,
 			),
-			wantVerdict: QualityWithhold,
+			wantVerdict: QualityDeliverPenalized,
 		},
 		{
 			name:     "responses aggregate does not double count deltas",
@@ -1603,14 +1602,14 @@ func TestAttemptLoopQualityHoldPreservesReplaySafety(t *testing.T) {
 			previous:    true,
 			body:        `{"model":"grok-4.6","previous_response_id":"resp-root","input":"continue","stream":true}`,
 			onExhausted: qualityRetryFailClosed,
-			wantError:   true,
+			wantError:   false,
 			wantMissing: true,
 		},
 		{
 			name:        "hosted tool fail closed executes once",
 			body:        `{"model":"grok-4.6","tools":[{"type":"web_search"}],"input":"search","stream":true}`,
 			onExhausted: qualityRetryFailClosed,
-			wantError:   true,
+			wantError:   false,
 			wantMissing: true,
 		},
 		{
@@ -1792,7 +1791,7 @@ func TestAttemptLoopQualityHold(t *testing.T) {
 	}
 
 	noThink := sse(
-		`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"abcd\"}"}}]}}]}`,
 		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
 		"data: [DONE]",
 	)
@@ -1920,9 +1919,8 @@ func TestAttemptLoopQualityHoldFailOpenKeepsSingleAccountBody(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content := strings.Repeat("abcd", 40)
 	noThink := sse(
-		`data: {"choices":[{"delta":{"content":"`+content+`"}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"abcd\"}"}}]}}]}`,
 		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
 		"data: [DONE]",
 	)
@@ -1951,7 +1949,7 @@ func TestAttemptLoopQualityHoldFailOpenKeepsSingleAccountBody(t *testing.T) {
 	}
 	result.Finalize(Usage{Reported: true, OutputTokens: 40}, "chat-single", "")
 	_ = result.Body.Close()
-	if !strings.Contains(string(body), content) {
+	if !strings.Contains(string(body), "abcd") {
 		t.Fatalf("fail-open lost the held body: %s", body)
 	}
 	if attempts := adapter.Attempts(); len(attempts) != 1 || attempts[0] != credential.ID {
@@ -2012,10 +2010,9 @@ func TestAttemptLoopQualityFailOpenFallbackAndTotalAttemptCap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content := strings.Repeat("fallback", 24)
 	responses := make(map[uint64][]scriptedBuildResponse, len(credentials))
 	responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: sse(
-		`data: {"choices":[{"delta":{"content":"`+content+`"}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"fallback\"}"}}]}}]}`,
 		`data: {"usage":{"completion_tokens":48,"completion_tokens_details":{"reasoning_tokens":0}}}`,
 		"data: [DONE]",
 	)}}
@@ -2045,7 +2042,7 @@ func TestAttemptLoopQualityFailOpenFallbackAndTotalAttemptCap(t *testing.T) {
 	}
 	result.Finalize(Usage{Reported: true, OutputTokens: 48}, "chat-fallback", "")
 	_ = result.Body.Close()
-	if !strings.Contains(string(body), content) {
+	if !strings.Contains(string(body), "fallback") {
 		t.Fatalf("retained fail-open response was lost: %s", body)
 	}
 	if attempts := adapter.Attempts(); len(attempts) != 6 || attempts[0] != credentials[0].ID {

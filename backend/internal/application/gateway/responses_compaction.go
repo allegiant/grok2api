@@ -5,10 +5,14 @@ import (
 	"strings"
 )
 
-// Distinctive line from grok-build full_replace_summary_prompt.txt and the
-// Grok TUI compaction request. Codex remote-v2 uses compaction_trigger
-// instead; the TUI appends this prompt as a normal last user item.
-const clientCompactionPromptMarker = "it is a system-generated compaction prompt, not a real user message"
+// Distinctive lines from known compaction prompts. Codex remote-v2 uses
+// compaction_trigger. Grok TUI appends the first sentence as the last user
+// item. Claude Code 2.1.331 has three summary prompts, and all of them start
+// with the second sentence.
+const (
+	clientCompactionPromptMarker = "it is a system-generated compaction prompt, not a real user message"
+	claudeCodeCompactionMarker   = "Your task is to create a detailed summary of"
+)
 
 type responsesCompactionKind uint8
 
@@ -38,7 +42,7 @@ func classifyResponsesCompactionRequest(body []byte) responsesCompactionKind {
 	if hasCompactionTrigger(payload.Input) {
 		return responsesCompactionTrigger
 	}
-	if lastItemLooksLikeCompactionPrompt(payload.Input) || lastItemLooksLikeCompactionPrompt(payload.Messages) {
+	if latestUserTextLooksLikeCompactionPrompt(payload.Input) || latestUserTextLooksLikeCompactionPrompt(payload.Messages) {
 		return responsesCompactionTUI
 	}
 	return responsesCompactionNone
@@ -59,22 +63,26 @@ func hasCompactionTrigger(items []json.RawMessage) bool {
 	return false
 }
 
-func lastItemLooksLikeCompactionPrompt(items []json.RawMessage) bool {
-	if len(items) == 0 {
-		return false
+func latestUserTextLooksLikeCompactionPrompt(items []json.RawMessage) bool {
+	for i := len(items) - 1; i >= 0; i-- {
+		var item struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		}
+		if json.Unmarshal(items[i], &item) != nil || !strings.EqualFold(strings.TrimSpace(item.Role), "user") {
+			continue
+		}
+		text := strings.TrimSpace(extractContentText(item.Content))
+		if text == "" {
+			continue
+		}
+		return looksLikeCompactionPrompt(text)
 	}
-	var item struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	}
-	if json.Unmarshal(items[len(items)-1], &item) != nil || !strings.EqualFold(strings.TrimSpace(item.Role), "user") {
-		return false
-	}
-	return looksLikeCompactionPrompt(extractContentText(item.Content))
+	return false
 }
 
 func looksLikeCompactionPrompt(text string) bool {
-	return strings.Contains(text, clientCompactionPromptMarker)
+	return strings.Contains(text, clientCompactionPromptMarker) || strings.Contains(text, claudeCodeCompactionMarker)
 }
 
 func extractContentText(raw json.RawMessage) string {

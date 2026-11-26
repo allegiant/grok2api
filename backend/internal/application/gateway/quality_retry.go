@@ -83,24 +83,25 @@ type QualityStreamSignals struct {
 	ReasoningStarted      bool
 	EncryptedContentValid bool
 	VisibleTokens         int64
-	ReasoningTokens  int64
-	OutputTokens     int64
-	EncryptedBytes   int
-	EncryptedFloor   int64
-	UsageReported    bool
-	FirstVisible     bool
-	VisibleFlushMS   int64
-	Terminal         bool
-	HoldExpired      bool
+	ReasoningTokens       int64
+	OutputTokens          int64
+	EncryptedBytes        int
+	EncryptedFloor        int64
+	UsageReported         bool
+	FirstVisible          bool
+	VisibleFlushMS        int64
+	Terminal              bool
+	HoldExpired           bool
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
 type QualityVerdict string
 
 const (
-	QualityWait     QualityVerdict = "wait"
-	QualityDeliver  QualityVerdict = "deliver"
-	QualityWithhold QualityVerdict = "withhold"
+	QualityWait             QualityVerdict = "wait"
+	QualityDeliver          QualityVerdict = "deliver"
+	QualityDeliverPenalized QualityVerdict = "deliver_penalized"
+	QualityWithhold         QualityVerdict = "withhold"
 )
 
 // QualityRetryAction is what the attempt loop does with a withhold verdict.
@@ -322,31 +323,37 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 		effectiveMinOutput = min(minOutput, defaultQualityMinOutput)
 	}
 	enough := output >= effectiveMinOutput
-	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
+	// A stream that has not finished is only buffered. Visible text without
+	// reasoning is not judged until the response is terminal or the hold
+	// timeout forces a decision, so a summary is not cut off mid-generation.
+	if !sig.Terminal && !sig.HoldExpired {
 		return QualityWait
 	}
-	if sig.Terminal {
+	if !sig.Terminal {
 		if output <= 0 {
 			return QualityWait
 		}
-		if enough {
-			return QualityWithhold
+		if !enough {
+			return QualityDeliver
 		}
-		return QualityDeliver
-	}
-	if enough {
+		if sig.VisibleTokens > 0 {
+			return QualityDeliverPenalized
+		}
 		return QualityWithhold
 	}
-	if sig.HoldExpired {
-		if output <= 0 {
-			return QualityWait
-		}
-		if enough {
-			return QualityWithhold
-		}
+	if output <= 0 {
+		return QualityWait
+	}
+	if !enough {
 		return QualityDeliver
 	}
-	return QualityWait
+	// Function-call-only output has no visible text. That remains a withhold.
+	// A finished prose response is returned to the client and the account is
+	// still cooled by the attempt loop.
+	if sig.VisibleTokens > 0 {
+		return QualityDeliverPenalized
+	}
+	return QualityWithhold
 }
 
 // qualityPeekAbortError prefers the idle-timeout cause over a plain
