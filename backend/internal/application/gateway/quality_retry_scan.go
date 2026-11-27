@@ -45,6 +45,7 @@ type qualityStreamDiagnostic struct {
 	ReasoningPayloadBytes  int      `json:"reasoning_payload_bytes,omitempty"`
 	EncryptedContentValid  bool     `json:"encrypted_content_valid"`
 	UsageReported          bool     `json:"usage_reported"`
+	FirstVisibleAfterHold  bool     `json:"first_visible_after_hold,omitempty"`
 }
 
 type qualityPeekMetadata struct {
@@ -68,6 +69,7 @@ type qualityScanState struct {
 	encryptedBytesPerReasoningToken int
 	usage                           Usage
 	terminal                        bool
+	holdDeadline                    time.Time
 	holdExpired                     bool
 	firstOutputAt                   time.Time
 	firstVisibleAt                  time.Time
@@ -183,6 +185,7 @@ func (s *qualityScanState) peekMetadata() qualityPeekMetadata {
 	stream.ReasoningPayloadBytes = s.encryptedBytes
 	stream.EncryptedContentValid = s.validEncryptedContent
 	stream.UsageReported = s.usage.Reported
+	stream.FirstVisibleAfterHold = sig.FirstVisibleAfterHold
 	return qualityPeekMetadata{
 		Stream:        stream,
 		FirstOutputAt: s.firstOutputAt,
@@ -327,6 +330,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		EncryptedFloor:        floor,
 		UsageReported:         s.usage.Reported,
 		FirstVisible:          firstVisible,
+		FirstVisibleAfterHold: firstVisible && !s.holdDeadline.IsZero() && !s.firstVisibleAt.Before(s.holdDeadline),
 		VisibleFlushMS:        flushMS,
 		Terminal:              s.terminal,
 		HoldExpired:           s.holdExpired,
@@ -783,7 +787,7 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 			if plainText != "" {
 				visibleRunes += utf8.RuneCountInString(plainText)
 				state.semanticOutput = true
-				noteFirstOutput(state)
+				noteFirstVisibleOutput(state)
 			}
 			return visibleRunes
 		}
@@ -801,7 +805,7 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 				if text != "" {
 					visibleRunes += utf8.RuneCountInString(text)
 					state.semanticOutput = true
-					noteFirstOutput(state)
+					noteFirstVisibleOutput(state)
 					continue
 				}
 				if content.Type != "" && content.Type != "output_text" && content.Type != "refusal" {
@@ -901,26 +905,32 @@ func noteVisibleContent(state *qualityScanState, text string) {
 	if text == "" {
 		return
 	}
+	noteFirstVisibleOutput(state)
+	state.visibleRunes += utf8.RuneCountInString(text)
+}
+
+func noteFirstVisibleOutput(state *qualityScanState) {
 	noteFirstOutput(state)
 	if state.firstVisibleAt.IsZero() {
 		state.firstVisibleAt = time.Now()
 	}
-	state.visibleRunes += utf8.RuneCountInString(text)
 }
 
-func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, qualityPeekMetadata, error) {
+func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime, upstreamStartedAt time.Time) (io.ReadCloser, QualityVerdict, Usage, qualityPeekMetadata, error) {
 	cfg = normalizeQualityRetry(cfg)
 	if body == nil {
 		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, qualityPeekMetadata{}, errQualityEmptyStream
 	}
+	holdDeadline := upstreamStartedAt.Add(cfg.HoldTimeout)
 	pump := newQualityReadPump(body)
 	state := qualityScanState{
 		protocol:                        protocol,
 		minEncryptedBytes:               cfg.MinEncryptedBytes,
 		encryptedBytesPerReasoningToken: cfg.EncryptedBytesPerReasoningToken,
+		holdDeadline:                    holdDeadline,
 	}
 	var held bytes.Buffer
-	holdTimer := time.NewTimer(cfg.HoldTimeout)
+	holdTimer := time.NewTimer(time.Until(holdDeadline))
 	defer holdTimer.Stop()
 	for {
 		sig := state.signals()

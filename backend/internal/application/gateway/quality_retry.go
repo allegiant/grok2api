@@ -89,6 +89,7 @@ type QualityStreamSignals struct {
 	EncryptedFloor        int64
 	UsageReported         bool
 	FirstVisible          bool
+	FirstVisibleAfterHold bool
 	VisibleFlushMS        int64
 	Terminal              bool
 	HoldExpired           bool
@@ -289,6 +290,12 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) {
 		return QualityWithhold
 	}
+	// The deadline may expire before the first text arrives. Keep that text
+	// held while usage or late reasoning can still change the verdict.
+	lateTextWithoutThinking := sig.FirstVisibleAfterHold && !sig.HasReasoningDelta && sig.ReasoningTokens <= 0
+	if lateTextWithoutThinking && !sig.Terminal {
+		return QualityWait
+	}
 	if qualityHasValidThinking(sig) {
 		if sig.HasReasoningDelta {
 			return QualityDeliver
@@ -322,38 +329,18 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if sig.Terminal && (sig.ReasoningStarted || sig.EncryptedBytes > 0 || sig.UsageReported) && sig.ReasoningTokens <= 0 {
 		effectiveMinOutput = min(minOutput, defaultQualityMinOutput)
 	}
-	enough := output >= effectiveMinOutput
-	// A stream that has not finished is only buffered. Visible text without
-	// reasoning is not judged until the response is terminal or the hold
-	// timeout forces a decision, so a summary is not cut off mid-generation.
-	if !sig.Terminal && !sig.HoldExpired {
+	if output <= 0 || (!sig.Terminal && !sig.HoldExpired) {
 		return QualityWait
 	}
-	if !sig.Terminal {
-		if output <= 0 {
-			return QualityWait
-		}
-		if !enough {
-			return QualityDeliver
-		}
-		if sig.VisibleTokens > 0 {
-			return QualityDeliverPenalized
-		}
-		return QualityWithhold
-	}
-	if output <= 0 {
-		return QualityWait
-	}
-	if !enough {
+	if output < effectiveMinOutput {
 		return QualityDeliver
 	}
-	// Function-call-only output has no visible text. That remains a withhold.
-	// A finished prose response is returned to the client and the account is
-	// still cooled by the attempt loop.
-	if sig.VisibleTokens > 0 {
-		return QualityDeliverPenalized
+	// Retry function-call-only output and late text whose final usage confirms
+	// zero reasoning. Other prose is delivered with an account penalty.
+	if sig.VisibleTokens <= 0 || (lateTextWithoutThinking && sig.UsageReported) {
+		return QualityWithhold
 	}
-	return QualityWithhold
+	return QualityDeliverPenalized
 }
 
 // qualityPeekAbortError prefers the idle-timeout cause over a plain

@@ -152,9 +152,10 @@ qualityGuard:
   # Optional request-path withhold/retry for thinking models.
   # Recommended lab values are filled in; enabled and autoDisable stay false
   # so stock installs do not intercept. Either switch enables detection.
-  # Observe up to 30s for real reasoning evidence. A reasoning-item stub plus
-  # enough visible output at the deadline is withheld (TUI dump after 30s),
-  # not released as late ciphertext. Empty stub-only streams keep waiting.
+  # Measure holdTimeout from the start of the upstream attempt. When the
+  # first visible text arrives after that window, keep it buffered until
+  # reasoning evidence or completion. Reported zero reasoning with enough
+  # output then follows the retry policy. Empty and stub-only streams keep waiting.
   # Floor-met ciphertext that then dumps a short greeting in under 1s is
   # also withheld. TUI follow-ups (previous_response_id) and hosted tools
   # stay held for classification, but a quality withhold never replays
