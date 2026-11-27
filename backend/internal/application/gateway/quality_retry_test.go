@@ -51,6 +51,8 @@ func TestClassifyQualityHold(t *testing.T) {
 		{name: "stub terminal enough text delivers and penalizes", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, Terminal: true}, want: QualityDeliverPenalized},
 		{name: "wait for more", sig: QualityStreamSignals{VisibleTokens: 8}, want: QualityWait},
 		{name: "hold expired short delivers", sig: QualityStreamSignals{VisibleTokens: 8, HoldExpired: true}, want: QualityDeliver},
+		{name: "reasoning request holds early text past deadline while usage is pending", sig: QualityStreamSignals{ReasoningExpected: true, VisibleTokens: 63, HoldExpired: true}, want: QualityWait},
+		{name: "reasoning request delivers completed text below the output floor", sig: QualityStreamSignals{ReasoningExpected: true, VisibleTokens: 1, OutputTokens: 1, Terminal: true, UsageReported: true}, want: QualityDeliver},
 		{name: "hold expired empty waits", sig: QualityStreamSignals{HoldExpired: true}, want: QualityWait},
 		{name: "hold expired zero tokens waits", sig: QualityStreamSignals{VisibleTokens: 0, OutputTokens: 0, HoldExpired: true}, want: QualityWait},
 	}
@@ -857,7 +859,7 @@ func TestPeekQualityStreamThinkingDeliversRemainder(t *testing.T) {
 		`data: {"choices":[{"delta":{"content":"answer after think"}}]}`,
 		"data: [DONE]",
 	)))
-	replay, verdict, _, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second}, time.Now())
+	replay, verdict, _, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second}, time.Now(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -883,7 +885,7 @@ func TestPeekQualityStreamCipherBurstWaitsAcrossEventSplits(t *testing.T) {
 	cfg := QualityRetryRuntime{MinOutputTokens: 8, HoldTimeout: 2 * time.Second}
 
 	coalesced, coalescedVerdict, _, _, err := peekQualityStream(
-		context.Background(), io.NopCloser(strings.NewReader(createdAndCipher+visible+completed)), qualityProtocolResponses, cfg, time.Now(),
+		context.Background(), io.NopCloser(strings.NewReader(createdAndCipher+visible+completed)), qualityProtocolResponses, cfg, time.Now(), false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -901,7 +903,7 @@ func TestPeekQualityStreamCipherBurstWaitsAcrossEventSplits(t *testing.T) {
 	}
 	done := make(chan peekResult, 1)
 	go func() {
-		replay, verdict, _, _, peekErr := peekQualityStream(context.Background(), reader, qualityProtocolResponses, cfg, time.Now())
+		replay, verdict, _, _, peekErr := peekQualityStream(context.Background(), reader, qualityProtocolResponses, cfg, time.Now(), false)
 		done <- peekResult{replay: replay, verdict: verdict, err: peekErr}
 	}()
 	if _, err := io.WriteString(writer, createdAndCipher); err != nil {
@@ -954,7 +956,7 @@ func TestPeekQualityStreamWithholdsNoThinkEnough(t *testing.T) {
 		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
 		"data: [DONE]",
 	)))
-	replay, verdict, usage, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second}, time.Now())
+	replay, verdict, usage, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second}, time.Now(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -976,7 +978,7 @@ func TestPeekThenDecideQualityRetryBounded(t *testing.T) {
 	)
 	cfg := QualityRetryRuntime{MinOutputTokens: 32, MaxAttempts: 2, OnExhausted: qualityRetryFailOpen, HoldTimeout: time.Second}
 
-	replay, verdict, usage, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(fixture)), qualityProtocolChat, cfg, time.Now())
+	replay, verdict, usage, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(fixture)), qualityProtocolChat, cfg, time.Now(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -988,7 +990,7 @@ func TestPeekThenDecideQualityRetryBounded(t *testing.T) {
 		t.Fatalf("first withhold action=%s", got)
 	}
 
-	replay2, verdict2, _, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(fixture)), qualityProtocolChat, cfg, time.Now())
+	replay2, verdict2, _, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(fixture)), qualityProtocolChat, cfg, time.Now(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1013,7 +1015,7 @@ func TestPeekQualityStreamShortDelivers(t *testing.T) {
 		`data: {"choices":[{"delta":{"content":"hi"}}]}`,
 		"data: [DONE]",
 	)))
-	replay, verdict, _, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32}, time.Now())
+	replay, verdict, _, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32}, time.Now(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1050,7 +1052,7 @@ func TestPeekQualityStreamHoldTimeoutInterruptsBlockedReadAndPreservesRemainder(
 	replay, verdict, _, _, err := peekQualityStream(context.Background(), reader, qualityProtocolChat, QualityRetryRuntime{
 		MinOutputTokens: 32,
 		HoldTimeout:     30 * time.Millisecond,
-	}, started)
+	}, started, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1108,7 +1110,7 @@ func TestPeekQualityStreamHoldTimeoutDeliversStartedReasoningAndPreservesLateEvi
 	replay, verdict, _, _, err := peekQualityStream(context.Background(), reader, qualityProtocolResponses, QualityRetryRuntime{
 		MinOutputTokens: 8,
 		HoldTimeout:     30 * time.Millisecond,
-	}, started)
+	}, started, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1181,7 +1183,7 @@ func TestPeekQualityStreamClassifiesLateFirstTextWithFinalUsage(t *testing.T) {
 				time.Sleep(tc.headerDelay)
 				done := make(chan qualityOpenPeekResult, 1)
 				go func() {
-					replay, verdict, _, _, err := peekQualityStream(t.Context(), reader, qualityProtocolResponses, QualityRetryRuntime{HoldTimeout: 30 * time.Second}, upstreamStartedAt)
+					replay, verdict, _, _, err := peekQualityStream(t.Context(), reader, qualityProtocolResponses, QualityRetryRuntime{HoldTimeout: 30 * time.Second}, upstreamStartedAt, false)
 					done <- qualityOpenPeekResult{replay: replay, verdict: verdict, err: err}
 				}()
 				synctest.Wait()
@@ -1229,7 +1231,7 @@ func TestPeekQualityStreamHoldTimeoutEmptyDoesNotFailOpen(t *testing.T) {
 		_, verdict, _, _, peekErr = peekQualityStream(ctx, reader, qualityProtocolChat, QualityRetryRuntime{
 			MinOutputTokens: 32,
 			HoldTimeout:     20 * time.Millisecond,
-		}, time.Now())
+		}, time.Now(), false)
 	}()
 	select {
 	case <-done:
@@ -1268,7 +1270,7 @@ func TestPeekQualityStreamHoldTimeoutStubOnlyDoesNotFailOpen(t *testing.T) {
 		_, verdict, _, _, peekErr = peekQualityStream(ctx, reader, qualityProtocolChat, QualityRetryRuntime{
 			MinOutputTokens: 8,
 			HoldTimeout:     20 * time.Millisecond,
-		}, time.Now())
+		}, time.Now(), false)
 	}()
 	if err := <-writeDone; err != nil {
 		t.Fatal(err)
@@ -1307,6 +1309,7 @@ func peekOpenQualityStreamForTest(t *testing.T, protocol, stream string) quality
 			context.Background(), reader, protocol,
 			QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: 2 * time.Second},
 			time.Now(),
+			false,
 		)
 		done <- qualityOpenPeekResult{replay: replay, verdict: verdict, err: err}
 	}()
@@ -1458,6 +1461,7 @@ func TestPeekQualityStreamEmptyEOFRequestsAnotherAccount(t *testing.T) {
 		qualityProtocolResponses,
 		QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second},
 		time.Now(),
+		false,
 	)
 	if replay != nil {
 		defer replay.Close()
@@ -1477,6 +1481,7 @@ func TestPeekQualityStreamProcessesUnterminatedFinalEvent(t *testing.T) {
 		context.Background(), body, qualityProtocolResponses,
 		QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second},
 		time.Now(),
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -2281,7 +2286,7 @@ func TestIsToolResultContinuationRequest(t *testing.T) {
 }
 
 func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) {
-	newHarness := func(t *testing.T, dbName string, responses map[uint64][]scriptedBuildResponse) (*Service, *scriptedBuildAdapter, *relational.AccountRepository, *relational.AuditRepository, *memory.StickyStore, []accountdomain.Credential, clientkey.Key) {
+	newHarness := func(t *testing.T, dbName, upstreamModel string, responses map[uint64][]scriptedBuildResponse) (*Service, *scriptedBuildAdapter, *relational.AccountRepository, *relational.AuditRepository, *memory.StickyStore, []accountdomain.Credential, clientkey.Key) {
 		t.Helper()
 		ctx := context.Background()
 		database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), dbName))
@@ -2311,11 +2316,11 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 			}
 			credentials = append(credentials, credential)
 		}
-		if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.7"}); err != nil {
+		if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{upstreamModel}); err != nil {
 			t.Fatal(err)
 		}
 		for _, credential := range credentials {
-			if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.7"}, time.Now().UTC()); err != nil {
+			if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{upstreamModel}, time.Now().UTC()); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -2374,10 +2379,130 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 	)
 	toolContinuationBody := []byte(`{"model":"grok-4.7","stream":true,"input":[{"type":"message","role":"user","content":"check dir"},{"type":"reasoning","summary":[],"encrypted_content":"` + validCipher + `"},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
 
+	t.Run("Messages with explicit reasoning withholds completed zero-reasoning prose", func(t *testing.T) {
+		for _, tc := range []struct {
+			name        string
+			effort      string
+			serverTools int
+		}{
+			{name: "xhigh retry delivers thinking response", effort: modeldomain.ReasoningEffortXHigh},
+			{name: "low retry delivers thinking response", effort: modeldomain.ReasoningEffortLow},
+			{name: "executed server tool prevents replay", effort: modeldomain.ReasoningEffortXHigh, serverTools: 1},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"model":"grok-4.7","stream":true,"max_tokens":512,"thinking":{"type":"adaptive"},"output_config":{"effort":%q},"messages":[{"role":"user","content":"Continue the task"}]}`, tc.effort))
+				_, options, err := conversation.ConvertRequestWithOptions(body, "grok-4.7", conversation.OperationMessages)
+				if err != nil {
+					t.Fatal(err)
+				}
+				convert := func(upstream string) string {
+					t.Helper()
+					stream := conversation.ConvertResponseStreamWithOptions(io.NopCloser(strings.NewReader(upstream)), conversation.OperationMessages, options)
+					defer stream.Close()
+					converted, err := io.ReadAll(stream)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return string(converted)
+				}
+				const degradedText = "Repeated status text from the degraded account"
+				degraded := sse(
+					`data: {"type":"response.created","response":{"id":"resp-bad","model":"grok-4.7"}}`,
+					`data: {"type":"response.output_text.delta","delta":"`+degradedText+`"}`,
+					fmt.Sprintf(`data: {"type":"response.completed","response":{"id":"resp-bad","usage":{"input_tokens":115341,"output_tokens":63,"num_server_side_tools_used":%d,"output_tokens_details":{"reasoning_tokens":0}}}}`, tc.serverTools),
+				)
+				healthy := sse(
+					`data: {"type":"response.created","response":{"id":"resp-good","model":"grok-4.7"}}`,
+					`data: {"type":"response.reasoning_summary_text.delta","item_id":"rs-good","delta":"Plan the next step"}`,
+					`data: {"type":"response.output_text.delta","delta":"Healthy response"}`,
+					`data: {"type":"response.completed","response":{"id":"resp-good","usage":{"output_tokens":92,"output_tokens_details":{"reasoning_tokens":80}}}}`,
+				)
+				responses := make(map[uint64][]scriptedBuildResponse)
+				service, adapter, _, auditRepo, _, credentials, key := newHarness(t, "messages-reasoning.db", "grok-4.7", responses)
+				service.UpdateQualityRetry(QualityRetryRuntime{Enabled: true, HoldTimeout: 30 * time.Second, OnExhausted: qualityRetryFailClosed})
+				responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: convert(degraded), reasoningEffort: options.ReasoningEffort}}
+				responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: convert(healthy), reasoningEffort: options.ReasoningEffort}}
+				ctx := t.Context()
+				result, err := service.CreateMessage(ctx, Input{
+					RequestID: "messages-reasoning", ClientKey: key, PublicModel: "Build/grok-4.7", Streaming: true, Body: body,
+				})
+				if result != nil {
+					defer result.Body.Close()
+				}
+				attempts := adapter.Attempts()
+				if tc.serverTools > 0 {
+					var failure *UpstreamFailure
+					if !errors.As(err, &failure) || failure.Code != ErrorQualityDegraded || failure.HTTPStatus != http.StatusServiceUnavailable || len(attempts) != 1 {
+						t.Fatalf("expected quality_degraded without replay, attempts=%v err=%v", attempts, err)
+					}
+				} else {
+					if err != nil || result == nil || len(attempts) != 2 || attempts[1] != credentials[1].ID {
+						t.Fatalf("expected a retry on the thinking account, attempts=%v err=%v", attempts, err)
+					}
+					output, err := io.ReadAll(result.Body)
+					if err != nil || strings.Contains(string(output), degradedText) || !strings.Contains(string(output), "Healthy response") {
+						t.Fatalf("unexpected client stream: %s, err=%v", output, err)
+					}
+					result.Finalize(Usage{Reported: true, OutputTokens: 92, ReasoningTokens: 80}, "resp-good", "")
+				}
+				logs, _, err := auditRepo.List(ctx, 0, 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, record := range logs {
+					if record.StatusCode == http.StatusOK && record.ErrorCode == ErrorQualityDegraded && record.ReasoningEffort == tc.effort &&
+						record.InputTokens == 115341 && record.OutputTokens == 63 && record.ReasoningTokens == 0 && record.NumServerSideToolsUsed == int64(tc.serverTools) {
+						return
+					}
+				}
+				t.Fatal("withheld upstream response is missing from the audit")
+			})
+		}
+	})
+
+	t.Run("automatic reasoning uses the Build catalog default", func(t *testing.T) {
+		const upstreamModel = "grok-quality-catalog-default"
+		modeldomain.RegisterUpstreamModelProfile(upstreamModel, modeldomain.UpstreamModelProfile{
+			ReasoningEfforts:       []string{modeldomain.ReasoningEffortHigh, modeldomain.ReasoningEffortNone},
+			DefaultReasoningEffort: modeldomain.ReasoningEffortHigh,
+		})
+		for _, tc := range []struct {
+			name   string
+			effort string
+			body   string
+		}{
+			{name: "auto", effort: "auto", body: `{"input":"Continue","stream":true,"reasoning":{"effort":"auto"}}`},
+			{name: "omitted", body: `{"input":"Continue","stream":true}`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				responses := make(map[uint64][]scriptedBuildResponse)
+				service, adapter, _, _, _, credentials, key := newHarness(t, "catalog-default.db", upstreamModel, responses)
+				service.UpdateQualityRetry(QualityRetryRuntime{Enabled: true, HoldTimeout: 30 * time.Second, OnExhausted: qualityRetryFailClosed})
+				responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: strings.ReplaceAll(cleanTextStreamNoReasoning, "grok-4.7", upstreamModel), reasoningEffort: tc.effort}}
+				responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: strings.ReplaceAll(toolCallWithReasoning, "grok-4.7", upstreamModel), reasoningEffort: tc.effort}}
+				result, err := service.CreateResponse(t.Context(), Input{
+					RequestID: "catalog-default", ClientKey: key, PublicModel: "Build/" + upstreamModel, Streaming: true, Body: []byte(tc.body),
+				})
+				if result != nil {
+					defer result.Body.Close()
+				}
+				attempts := adapter.Attempts()
+				if err != nil || result == nil || len(attempts) != 2 || attempts[1] != credentials[1].ID {
+					t.Fatalf("expected a retry using the declared reasoning default, attempts=%v err=%v", attempts, err)
+				}
+				output, err := io.ReadAll(result.Body)
+				if err != nil || strings.Contains(string(output), "TAIL_CHUNK_DELIVERED") || !strings.Contains(string(output), validCipher) {
+					t.Fatalf("unexpected client stream: %s, err=%v", output, err)
+				}
+				result.Finalize(Usage{Reported: true, OutputTokens: 142, ReasoningTokens: 100}, "resp-mt-ok", "")
+			})
+		}
+	})
+
 	t.Run("single degraded account before thinking account isolates prompt_cache_key and applies full cooldown", func(t *testing.T) {
 		ctx := context.Background()
 		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-single-degraded.db", responses)
+		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-single-degraded.db", "grok-4.7", responses)
 		responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: cleanToolCallNoReasoning}}
 		responses[credentials[1].ID] = []scriptedBuildResponse{
 			{status: http.StatusOK, body: toolCallWithReasoning},
@@ -2447,7 +2572,7 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 	t.Run("tool call withhold then finished prose is delivered and both accounts are cooled", func(t *testing.T) {
 		ctx := context.Background()
 		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-strict-penalty.db", responses)
+		service, adapter, accountRepo, auditRepo, _, credentials, key := newHarness(t, "mt-strict-penalty.db", "grok-4.7", responses)
 		service.UpdateQualityRetry(QualityRetryRuntime{
 			Enabled: true, MaxAttempts: 3, MinOutputTokens: 8,
 			AutoDisable: false, AccountCooldown: 24 * time.Hour, IdleAccountCooldown: 15 * time.Minute,
@@ -2629,7 +2754,7 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 	t.Run("malformed stub 0-reasoning exhaustion still applies full auto-disable penalty", func(t *testing.T) {
 		ctx := context.Background()
 		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-stub-disable.db", responses)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-stub-disable.db", "grok-4.7", responses)
 		service.UpdateQualityRetry(QualityRetryRuntime{
 			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
 			AutoDisable: true, AccountCooldown: 24 * time.Hour, IdleAccountCooldown: 15 * time.Minute,
@@ -2661,7 +2786,7 @@ func TestAttemptLoopToolContinuationConsensusAndDegradedDetection(t *testing.T) 
 	t.Run("failed quota probe does not steal quality retry attempt budget", func(t *testing.T) {
 		ctx := context.Background()
 		responses := make(map[uint64][]scriptedBuildResponse)
-		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-quota-probe-budget.db", responses)
+		service, adapter, accountRepo, _, _, credentials, key := newHarness(t, "mt-quota-probe-budget.db", "grok-4.7", responses)
 		service.UpdateQualityRetry(QualityRetryRuntime{
 			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
 			OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,

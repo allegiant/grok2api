@@ -25,6 +25,7 @@ func TestPeekQualityStreamDiagnosticIsBoundedAndContentFree(t *testing.T) {
 		qualityProtocolResponses,
 		QualityRetryRuntime{MinOutputTokens: 8, HoldTimeout: time.Second},
 		time.Now(),
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)

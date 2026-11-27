@@ -4287,8 +4287,8 @@ func TestQualityProbeSelectionFailureOmitsRequestAudit(t *testing.T) {
 
 	_, err = service.CreateChatCompletion(ctx, Input{
 		RequestID: "quality-probe-pinned-missing", ClientKey: clientKey, PublicModel: model,
-		Body:               []byte(`{"model":"grok-probe-audit","messages":[{"role":"user","content":"probe"}]}`),
-		Streaming:          true, ForcedEgressNodeID: 7, ForcedAccountID: 13088,
+		Body:      []byte(`{"model":"grok-probe-audit","messages":[{"role":"user","content":"probe"}]}`),
+		Streaming: true, ForcedEgressNodeID: 7, ForcedAccountID: 13088,
 	})
 	var unavailable *SelectionUnavailableError
 	if !errors.As(err, &unavailable) || unavailable.Reason != SelectionPinnedUnavailable {
@@ -4378,9 +4378,10 @@ func TestGatewayPinnedResponseReturnsCachedTeamRateLimitWithoutSpinning(t *testi
 }
 
 type scriptedBuildResponse struct {
-	status int
-	body   string
-	header http.Header
+	status          int
+	body            string
+	header          http.Header
+	reasoningEffort string
 }
 
 type forcedQualityProbeAdapter struct {
@@ -4480,6 +4481,9 @@ func (a *scriptedBuildAdapter) ForwardResponse(_ context.Context, request provid
 	}
 	next := queue[0]
 	a.responses[request.Credential.ID] = queue[1:]
+	if request.NormalizedMetadata != nil {
+		request.NormalizedMetadata.ReasoningEffort = next.reasoningEffort
+	}
 	header := next.header.Clone()
 	if header == nil {
 		header = make(http.Header)

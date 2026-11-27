@@ -75,6 +75,7 @@ type QualityRetryRuntime struct {
 // QualityStreamSignals is the hold classifier input. Tests drive this
 // directly and via ObserveQualityChunk on SSE fixtures.
 type QualityStreamSignals struct {
+	ReasoningExpected bool
 	HasThinking       bool
 	HasReasoningDelta bool
 	// ReasoningStarted is an empty reasoning item or the Chat SSE stub
@@ -290,10 +291,11 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) {
 		return QualityWithhold
 	}
-	// The deadline may expire before the first text arrives. Keep that text
-	// held while usage or late reasoning can still change the verdict.
-	lateTextWithoutThinking := sig.FirstVisibleAfterHold && !sig.HasReasoningDelta && sig.ReasoningTokens <= 0
-	if lateTextWithoutThinking && !sig.Terminal {
+	// When the request expects reasoning or its first text arrives late, hold
+	// text until reasoning evidence or final usage can settle the verdict.
+	expectReasoning := sig.ReasoningExpected || sig.FirstVisibleAfterHold
+	checkFinalReasoning := expectReasoning && !sig.HasReasoningDelta && sig.ReasoningTokens <= 0
+	if checkFinalReasoning && sig.VisibleTokens > 0 && !sig.Terminal {
 		return QualityWait
 	}
 	if qualityHasValidThinking(sig) {
@@ -335,9 +337,9 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if output < effectiveMinOutput {
 		return QualityDeliver
 	}
-	// Retry function-call-only output and late text whose final usage confirms
-	// zero reasoning. Other prose is delivered with an account penalty.
-	if sig.VisibleTokens <= 0 || (lateTextWithoutThinking && sig.UsageReported) {
+	// Retry function-call-only output and text whose final usage confirms
+	// zero reasoning when the request expects reasoning.
+	if sig.VisibleTokens <= 0 || (checkFinalReasoning && sig.UsageReported) {
 		return QualityWithhold
 	}
 	return QualityDeliverPenalized
@@ -468,6 +470,15 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 		return true
 	}
 	return modeldomain.SupportsReasoningForProvider(route.Provider, route.UpstreamModel)
+}
+
+func qualityExpectsReasoning(route modeldomain.Route, effort string) bool {
+	if route.Provider == accountdomain.ProviderBuild && (effort == "" || effort == "auto") {
+		// The Build catalog supplies the declared default for automatic requests.
+		profile, _ := modeldomain.UpstreamProfile(route.UpstreamModel)
+		effort = profile.DefaultReasoningEffort
+	}
+	return effort != "" && effort != modeldomain.ReasoningEffortNone && effort != "auto"
 }
 
 // canReplayQualityHoldAcrossAccounts separates response classification from
@@ -960,6 +971,7 @@ func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, 
 	record.ReasoningTokens = usage.ReasoningTokens
 	record.TotalTokens = usage.TotalTokens
 	record.InputTokens = usage.InputTokens
+	record.NumServerSideToolsUsed = usage.NumServerSideToolsUsed
 	if usage.Reported {
 		record.UsageSource = audit.UsageSourceUpstream
 	}

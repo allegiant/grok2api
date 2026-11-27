@@ -1674,7 +1674,8 @@ attemptLoop:
 			skipOutputSpeedPenalty := false
 			var heldFirstOutputAt time.Time
 			if qualityHoldEnabled {
-				replay, verdict, peekUsage, peekMetadata, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg, responseStartedAt)
+				reasoningExpected := qualityExpectsReasoning(route, normalizedMetadata.ReasoningEffort)
+				replay, verdict, peekUsage, peekMetadata, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg, responseStartedAt, reasoningExpected)
 				if peekErr != nil {
 					if replay != nil {
 						reasoningreplay.DiscardCapture(replay)

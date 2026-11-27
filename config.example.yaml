@@ -155,7 +155,9 @@ qualityGuard:
   # Measure holdTimeout from the start of the upstream attempt. When the
   # first visible text arrives after that window, keep it buffered until
   # reasoning evidence or completion. Reported zero reasoning with enough
-  # output then follows the retry policy. Empty and stub-only streams keep waiting.
+  # output then follows the retry policy. An explicit reasoning effort or a
+  # reasoning default declared by the Build catalog applies the same check
+  # within the window. Empty and stub-only streams keep waiting.
   # Floor-met ciphertext that then dumps a short greeting in under 1s is
   # also withheld. TUI follow-ups (previous_response_id) and hosted tools
   # stay held for classification, but a quality withhold never replays

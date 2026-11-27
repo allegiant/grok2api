@@ -55,6 +55,7 @@ type qualityPeekMetadata struct {
 
 type qualityScanState struct {
 	protocol                        string
+	reasoningExpected               bool
 	pending                         []byte
 	hasThinking                     bool
 	reasoningStarted                bool
@@ -319,6 +320,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		flushMS = time.Since(s.firstVisibleAt).Milliseconds()
 	}
 	return QualityStreamSignals{
+		ReasoningExpected:     s.reasoningExpected,
 		HasThinking:           hasThinking,
 		HasReasoningDelta:     s.hasThinking,
 		ReasoningStarted:      s.reasoningStarted || hasThinking,
@@ -427,29 +429,13 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 			} `json:"delta"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
-		Usage *struct {
-			PromptTokens            int64 `json:"prompt_tokens"`
-			CompletionTokens        int64 `json:"completion_tokens"`
-			TotalTokens             int64 `json:"total_tokens"`
-			CompletionTokensDetails struct {
-				ReasoningTokens int64 `json:"reasoning_tokens"`
-			} `json:"completion_tokens_details"`
-		} `json:"usage"`
+		Usage *qualityStreamUsage `json:"usage"`
 	}
 	if json.Unmarshal(payload, &event) != nil {
 		return
 	}
 	state.addDiagnosticEvent("chunk")
-	if event.Usage != nil {
-		state.usage.Reported = true
-		state.usage.InputTokens = event.Usage.PromptTokens
-		state.usage.OutputTokens = event.Usage.CompletionTokens
-		state.usage.ReasoningTokens = event.Usage.CompletionTokensDetails.ReasoningTokens
-		state.usage.TotalTokens = event.Usage.TotalTokens
-		state.usage.ResponseModel = event.Model
-		state.outputTokens = event.Usage.CompletionTokens
-		state.reasoningTokens = event.Usage.CompletionTokensDetails.ReasoningTokens
-	}
+	event.Usage.applyTo(state, event.Model)
 	for _, choice := range event.Choices {
 		delta := choice.Delta
 		if strings.TrimSpace(delta.Reasoning) != "" || strings.TrimSpace(delta.ReasoningContent) != "" || strings.TrimSpace(delta.ThinkingContent) != "" {
@@ -484,7 +470,7 @@ type qualityResponsesOutputItem struct {
 	Summary          json.RawMessage `json:"summary"`
 }
 
-type qualityResponsesUsage struct {
+type qualityStreamUsage struct {
 	OutputTokens            int64 `json:"output_tokens"`
 	OutputTokensCamel       int64 `json:"outputTokens"`
 	CompletionTokens        int64 `json:"completion_tokens"`
@@ -501,7 +487,10 @@ type qualityResponsesUsage struct {
 	ThinkingTokensCamel     int64 `json:"thinkingTokens"`
 	NumServerSideToolsUsed  int64 `json:"num_server_side_tools_used"`
 	NumServerSideToolsCamel int64 `json:"numServerSideToolsUsed"`
-	OutputTokensDetails     struct {
+	ServerToolUse           struct {
+		WebSearchRequests int64 `json:"web_search_requests"`
+	} `json:"server_tool_use"`
+	OutputTokensDetails struct {
 		ReasoningTokens      int64 `json:"reasoning_tokens"`
 		ReasoningTokensCamel int64 `json:"reasoningTokens"`
 		ThinkingTokens       int64 `json:"thinking_tokens"`
@@ -519,7 +508,7 @@ type qualityResponsesUsage struct {
 	} `json:"completion_tokens_details"`
 }
 
-func (u *qualityResponsesUsage) applyTo(state *qualityScanState, model string) {
+func (u *qualityStreamUsage) applyTo(state *qualityScanState, model string) {
 	if u == nil || state == nil {
 		return
 	}
@@ -545,13 +534,13 @@ func (u *qualityResponsesUsage) applyTo(state *qualityScanState, model string) {
 		u.ThinkingTokens,
 		u.ThinkingTokensCamel,
 	)
-	serverTools := firstPositiveInt64(u.NumServerSideToolsUsed, u.NumServerSideToolsCamel)
+	serverTools := max(u.NumServerSideToolsUsed, u.NumServerSideToolsCamel, u.ServerToolUse.WebSearchRequests)
 	state.usage.Reported = true
 	state.usage.InputTokens = input
 	state.usage.OutputTokens = output
 	state.usage.ReasoningTokens = reasoning
 	state.usage.TotalTokens = total
-	state.usage.NumServerSideToolsUsed = serverTools
+	state.usage.NumServerSideToolsUsed = max(state.usage.NumServerSideToolsUsed, serverTools)
 	if model != "" {
 		state.usage.ResponseModel = model
 	}
@@ -681,16 +670,16 @@ func recordResponsesContentTypes(state *qualityScanState, raw json.RawMessage, s
 
 func observeQualityResponses(state *qualityScanState, payload []byte) {
 	var event struct {
-		Type     string                 `json:"type"`
-		Delta    json.RawMessage        `json:"delta"`
-		Text     string                 `json:"text"`
-		Part     json.RawMessage        `json:"part"`
-		Item     json.RawMessage        `json:"item"`
-		Usage    *qualityResponsesUsage `json:"usage"`
+		Type     string              `json:"type"`
+		Delta    json.RawMessage     `json:"delta"`
+		Text     string              `json:"text"`
+		Part     json.RawMessage     `json:"part"`
+		Item     json.RawMessage     `json:"item"`
+		Usage    *qualityStreamUsage `json:"usage"`
 		Response *struct {
-			Model  string                 `json:"model"`
-			Output []json.RawMessage      `json:"output"`
-			Usage  *qualityResponsesUsage `json:"usage"`
+			Model  string              `json:"model"`
+			Output []json.RawMessage   `json:"output"`
+			Usage  *qualityStreamUsage `json:"usage"`
 		} `json:"response"`
 	}
 	if json.Unmarshal(payload, &event) != nil {
@@ -838,12 +827,7 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 			PartialJSON string `json:"partial_json"`
 			Signature   string `json:"signature"`
 		} `json:"delta"`
-		Usage *struct {
-			OutputTokens        int64 `json:"output_tokens"`
-			OutputTokensDetails struct {
-				ThinkingTokens int64 `json:"thinking_tokens"`
-			} `json:"output_tokens_details"`
-		} `json:"usage"`
+		Usage *qualityStreamUsage `json:"usage"`
 	}
 	if json.Unmarshal(payload, &event) != nil {
 		return
@@ -892,13 +876,7 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 			noteFirstOutput(state)
 		}
 	}
-	if event.Usage != nil {
-		state.usage.Reported = true
-		state.usage.OutputTokens = event.Usage.OutputTokens
-		state.usage.ReasoningTokens = event.Usage.OutputTokensDetails.ThinkingTokens
-		state.outputTokens = event.Usage.OutputTokens
-		state.reasoningTokens = event.Usage.OutputTokensDetails.ThinkingTokens
-	}
+	event.Usage.applyTo(state, "")
 }
 
 func noteVisibleContent(state *qualityScanState, text string) {
@@ -916,7 +894,7 @@ func noteFirstVisibleOutput(state *qualityScanState) {
 	}
 }
 
-func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime, upstreamStartedAt time.Time) (io.ReadCloser, QualityVerdict, Usage, qualityPeekMetadata, error) {
+func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime, upstreamStartedAt time.Time, reasoningExpected bool) (io.ReadCloser, QualityVerdict, Usage, qualityPeekMetadata, error) {
 	cfg = normalizeQualityRetry(cfg)
 	if body == nil {
 		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, qualityPeekMetadata{}, errQualityEmptyStream
@@ -925,6 +903,7 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 	pump := newQualityReadPump(body)
 	state := qualityScanState{
 		protocol:                        protocol,
+		reasoningExpected:               reasoningExpected,
 		minEncryptedBytes:               cfg.MinEncryptedBytes,
 		encryptedBytesPerReasoningToken: cfg.EncryptedBytesPerReasoningToken,
 		holdDeadline:                    holdDeadline,
